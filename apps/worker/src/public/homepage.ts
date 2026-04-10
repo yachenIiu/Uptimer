@@ -1,4 +1,5 @@
 import type { PublicHomepageResponse } from '../schemas/public-homepage';
+import type { PublicStatusResponse } from '../schemas/public-status';
 
 import {
   buildPublicStatusBanner,
@@ -64,6 +65,11 @@ type HomepageRollupRow = {
   uptime_sec: number;
 };
 
+type HomepageMonitorDataOptions = {
+  cardLimit?: number;
+  uptimeRatingLevel?: 1 | 2 | 3 | 4 | 5;
+};
+
 function toHeartbeatStatusCode(status: string | null | undefined): string {
   switch (status) {
     case 'up':
@@ -90,6 +96,20 @@ function toIncidentSummary(row: IncidentRow): IncidentSummary {
   };
 }
 
+function incidentSummaryFromStatusIncident(
+  incident: PublicStatusResponse['active_incidents'][number],
+): IncidentSummary {
+  return {
+    id: incident.id,
+    title: incident.title,
+    status: incident.status,
+    impact: incident.impact,
+    message: incident.message,
+    started_at: incident.started_at,
+    resolved_at: incident.resolved_at,
+  };
+}
+
 function toMaintenancePreview(
   row: MaintenanceWindowRow,
   monitorIds: number[],
@@ -101,6 +121,19 @@ function toMaintenancePreview(
     starts_at: row.starts_at,
     ends_at: row.ends_at,
     monitor_ids: monitorIds,
+  };
+}
+
+function maintenancePreviewFromStatusWindow(
+  window: PublicStatusResponse['maintenance_windows']['active'][number],
+): MaintenancePreview {
+  return {
+    id: window.id,
+    title: window.title,
+    message: window.message,
+    starts_at: window.starts_at,
+    ends_at: window.ends_at,
+    monitor_ids: window.monitor_ids,
   };
 }
 
@@ -160,11 +193,11 @@ function toHomepageMonitorType(value: string): HomepageMonitorCard['type'] {
   return value === 'tcp' ? 'tcp' : 'http';
 }
 
-function toHomepageMonitorCard(
-  row: HomepageMonitorRow,
+function computeHomepageMonitorPresentation(
+  row: Pick<HomepageMonitorRow, 'id' | 'interval_sec' | 'last_checked_at' | 'state_status'>,
   now: number,
   maintenanceMonitorIds: ReadonlySet<number>,
-): HomepageMonitorCard {
+): Pick<HomepageMonitorCard, 'status' | 'is_stale'> {
   const isInMaintenance = maintenanceMonitorIds.has(row.id);
   const stateStatus = toMonitorStatus(row.state_status);
   const isStale =
@@ -175,12 +208,25 @@ function toHomepageMonitorCard(
         : now - row.last_checked_at > row.interval_sec * 2;
 
   return {
+    status: isInMaintenance ? 'maintenance' : isStale ? 'unknown' : stateStatus,
+    is_stale: isStale,
+  };
+}
+
+function toHomepageMonitorCard(
+  row: HomepageMonitorRow,
+  now: number,
+  maintenanceMonitorIds: ReadonlySet<number>,
+): HomepageMonitorCard {
+  const presentation = computeHomepageMonitorPresentation(row, now, maintenanceMonitorIds);
+
+  return {
     id: row.id,
     name: row.name,
     type: toHomepageMonitorType(row.type),
     group_name: row.group_name?.trim() ? row.group_name.trim() : null,
-    status: isInMaintenance ? 'maintenance' : isStale ? 'unknown' : stateStatus,
-    is_stale: isStale,
+    status: presentation.status,
+    is_stale: presentation.is_stale,
     last_checked_at: row.last_checked_at,
     heartbeat_strip: {
       checked_at: [],
@@ -213,21 +259,14 @@ function addUptimeDay(
   totals.uptimeSec += uptime.uptime_sec;
 }
 
-async function buildHomepageMonitorData(
+async function listHomepageMonitorRows(
   db: D1Database,
-  now: number,
   includeHiddenMonitors: boolean,
-): Promise<{
-  monitors: HomepageMonitorCard[];
-  summary: PublicHomepageResponse['summary'];
-  overallStatus: HomepageMonitorStatus;
-  uptimeRatingLevel: 1 | 2 | 3 | 4 | 5;
-}> {
-  const rangeEndFullDays = utcDayStart(now);
-  const rangeEnd = now;
-  const { results } = await db
-    .prepare(
-      `
+  limit?: number,
+): Promise<HomepageMonitorRow[]> {
+  const limitClause = limit === undefined ? '' : '\n      LIMIT ?1';
+  const stmt = db.prepare(
+    `
       SELECT
         m.id,
         m.name,
@@ -250,58 +289,164 @@ async function buildHomepageMonitorData(
           END
         ) ASC,
         m.sort_order ASC,
-        m.id ASC
+        m.id ASC${limitClause}
+    `,
+  );
+
+  const result =
+    limit === undefined
+      ? await stmt.all<HomepageMonitorRow>()
+      : await stmt.bind(limit).all<HomepageMonitorRow>();
+
+  return result.results ?? [];
+}
+
+async function readHomepageMonitorSummary(
+  db: D1Database,
+  now: number,
+  includeHiddenMonitors: boolean,
+): Promise<{
+  monitorCountTotal: number;
+  summary: PublicHomepageResponse['summary'];
+  overallStatus: HomepageMonitorStatus;
+}> {
+  const row = await db
+    .prepare(
+      `
+      WITH active_maintenance AS (
+        SELECT DISTINCT mwm.monitor_id
+        FROM maintenance_window_monitors mwm
+        JOIN maintenance_windows mw ON mw.id = mwm.maintenance_window_id
+        WHERE mw.starts_at <= ?1 AND mw.ends_at > ?1
+      ),
+      visible_monitors AS (
+        SELECT
+          m.interval_sec,
+          COALESCE(s.status, 'unknown') AS normalized_status,
+          s.last_checked_at,
+          CASE WHEN am.monitor_id IS NULL THEN 0 ELSE 1 END AS in_maintenance
+        FROM monitors m
+        LEFT JOIN monitor_state s ON s.monitor_id = m.id
+        LEFT JOIN active_maintenance am ON am.monitor_id = m.id
+        WHERE m.is_active = 1
+          AND ${monitorVisibilityPredicate(includeHiddenMonitors, 'm')}
+      )
+      SELECT
+        COUNT(*) AS monitor_count_total,
+        SUM(
+          CASE
+            WHEN in_maintenance = 1 OR normalized_status = 'maintenance' THEN 1
+            ELSE 0
+          END
+        ) AS maintenance,
+        SUM(
+          CASE
+            WHEN in_maintenance = 0 AND normalized_status = 'paused' THEN 1
+            ELSE 0
+          END
+        ) AS paused,
+        SUM(
+          CASE
+            WHEN
+              in_maintenance = 0
+              AND normalized_status = 'down'
+              AND last_checked_at IS NOT NULL
+              AND ?1 - last_checked_at <= interval_sec * 2
+            THEN 1
+            ELSE 0
+          END
+        ) AS down,
+        SUM(
+          CASE
+            WHEN
+              in_maintenance = 0
+              AND normalized_status = 'up'
+              AND last_checked_at IS NOT NULL
+              AND ?1 - last_checked_at <= interval_sec * 2
+            THEN 1
+            ELSE 0
+          END
+        ) AS up,
+        SUM(
+          CASE
+            WHEN
+              in_maintenance = 1
+              OR normalized_status = 'maintenance'
+              OR (in_maintenance = 0 AND normalized_status = 'paused')
+              OR (
+                in_maintenance = 0
+                AND normalized_status = 'down'
+                AND last_checked_at IS NOT NULL
+                AND ?1 - last_checked_at <= interval_sec * 2
+              )
+              OR (
+                in_maintenance = 0
+                AND normalized_status = 'up'
+                AND last_checked_at IS NOT NULL
+                AND ?1 - last_checked_at <= interval_sec * 2
+              )
+            THEN 0
+            ELSE 1
+          END
+        ) AS unknown
+      FROM visible_monitors
     `,
     )
-    .all<HomepageMonitorRow>();
+    .bind(now)
+    .first<{
+      monitor_count_total: number | null;
+      up: number | null;
+      down: number | null;
+      maintenance: number | null;
+      paused: number | null;
+      unknown: number | null;
+    }>();
 
-  const rawMonitors = results ?? [];
-  const ids = rawMonitors.map((monitor) => monitor.id);
-  const earliestCreatedAt = rawMonitors.reduce(
+  const summary: PublicHomepageResponse['summary'] = {
+    up: row?.up ?? 0,
+    down: row?.down ?? 0,
+    maintenance: row?.maintenance ?? 0,
+    paused: row?.paused ?? 0,
+    unknown: row?.unknown ?? 0,
+  };
+
+  return {
+    monitorCountTotal: row?.monitor_count_total ?? 0,
+    summary,
+    overallStatus: computeOverallStatus(summary),
+  };
+}
+
+async function buildHomepageMonitorCardsFromRows(
+  db: D1Database,
+  now: number,
+  rows: HomepageMonitorRow[],
+  maintenanceMonitorIds: ReadonlySet<number>,
+): Promise<HomepageMonitorCard[]> {
+  if (rows.length === 0) {
+    return [];
+  }
+
+  const earliestCreatedAt = rows.reduce(
     (acc, monitor) => Math.min(acc, monitor.created_at),
     Number.POSITIVE_INFINITY,
   );
+  const rangeEndFullDays = utcDayStart(now);
+  const rangeEnd = now;
   const rangeStart = Number.isFinite(earliestCreatedAt)
     ? Math.max(rangeEnd - UPTIME_DAYS * 86400, earliestCreatedAt)
     : rangeEnd - UPTIME_DAYS * 86400;
-
-  const [maintenanceMonitorIds, uptimeRatingLevel] = await Promise.all([
-    listHomepageMaintenanceMonitorIds(db, now, ids),
-    readHomepageUptimeRatingLevel(db),
-  ]);
-
-  const summary: PublicHomepageResponse['summary'] = {
-    up: 0,
-    down: 0,
-    maintenance: 0,
-    paused: 0,
-    unknown: 0,
-  };
-
-  const monitors = new Array<HomepageMonitorCard>(rawMonitors.length);
-  const monitorIndexById = new Map<number, number>();
-  for (let index = 0; index < rawMonitors.length; index += 1) {
-    const row = rawMonitors[index];
-    if (!row) continue;
-
-    const monitor = toHomepageMonitorCard(row, now, maintenanceMonitorIds);
-    monitors[index] = monitor;
-    monitorIndexById.set(monitor.id, index);
-    summary[monitor.status] += 1;
-  }
-
-  if (ids.length === 0) {
-    return {
-      monitors,
-      summary,
-      overallStatus: computeOverallStatus(summary),
-      uptimeRatingLevel,
-    };
-  }
-
-  const placeholders = buildNumberedPlaceholders(ids.length);
+  const selectedIds = rows.map((monitor) => monitor.id);
+  const placeholders = buildNumberedPlaceholders(selectedIds.length);
   const todayStartAt = utcDayStart(now);
   const needsToday = rangeEnd > rangeEndFullDays && todayStartAt >= rangeStart;
+  const monitors = rows.map((row) => toHomepageMonitorCard(row, now, maintenanceMonitorIds));
+  const monitorIndexById = new Map<number, number>();
+  for (let index = 0; index < monitors.length; index += 1) {
+    const monitor = monitors[index];
+    if (!monitor) continue;
+    monitorIndexById.set(monitor.id, index);
+  }
 
   const heartbeatRowsPromise = db
     .prepare(
@@ -321,13 +466,13 @@ async function buildHomepageMonitorData(
         FROM check_results
         WHERE monitor_id IN (${placeholders})
       )
-      WHERE rn <= ?${ids.length + 1}
+      WHERE rn <= ?${selectedIds.length + 1}
       ORDER BY monitor_id, checked_at DESC, id DESC
     `,
     )
-    .bind(...ids, HEARTBEAT_POINTS)
+    .bind(...selectedIds, HEARTBEAT_POINTS)
     .all<HomepageHeartbeatRow>()
-    .then(({ results: rows }) => rows ?? []);
+    .then(({ results }) => results ?? []);
 
   const rollupRowsPromise = db
     .prepare(
@@ -335,19 +480,19 @@ async function buildHomepageMonitorData(
       SELECT monitor_id, day_start_at, total_sec, downtime_sec, unknown_sec, uptime_sec
       FROM monitor_daily_rollups
       WHERE monitor_id IN (${placeholders})
-        AND day_start_at >= ?${ids.length + 1}
-        AND day_start_at < ?${ids.length + 2}
+        AND day_start_at >= ?${selectedIds.length + 1}
+        AND day_start_at < ?${selectedIds.length + 2}
       ORDER BY monitor_id, day_start_at
     `,
     )
-    .bind(...ids, rangeStart, rangeEndFullDays)
+    .bind(...selectedIds, rangeStart, rangeEndFullDays)
     .all<HomepageRollupRow>()
-    .then(({ results: rows }) => rows ?? []);
+    .then(({ results }) => results ?? []);
 
   const todayByMonitorIdPromise: Promise<Map<number, UptimeWindowTotals>> = needsToday
     ? computeTodayPartialUptimeBatch(
         db,
-        rawMonitors.map((monitor) => ({
+        rows.map((monitor) => ({
           id: monitor.id,
           interval_sec: monitor.interval_sec,
           created_at: monitor.created_at,
@@ -425,8 +570,70 @@ async function buildHomepageMonitorData(
           };
   }
 
+  return monitors;
+}
+
+async function buildHomepageMonitorData(
+  db: D1Database,
+  now: number,
+  includeHiddenMonitors: boolean,
+  opts: HomepageMonitorDataOptions = {},
+): Promise<{
+  monitors: HomepageMonitorCard[];
+  monitorCountTotal: number;
+  summary: PublicHomepageResponse['summary'];
+  overallStatus: HomepageMonitorStatus;
+  uptimeRatingLevel: 1 | 2 | 3 | 4 | 5;
+}> {
+  const rawMonitors = await listHomepageMonitorRows(db, includeHiddenMonitors);
+  const monitorCountTotal = rawMonitors.length;
+  const ids = rawMonitors.map((monitor) => monitor.id);
+  const selectedRows =
+    opts.cardLimit === undefined ? rawMonitors : rawMonitors.slice(0, Math.max(0, opts.cardLimit));
+
+  const [maintenanceMonitorIds, uptimeRatingLevel] = await Promise.all([
+    listHomepageMaintenanceMonitorIds(db, now, ids),
+    opts.uptimeRatingLevel === undefined
+      ? readHomepageUptimeRatingLevel(db)
+      : Promise.resolve(opts.uptimeRatingLevel),
+  ]);
+
+  const summary: PublicHomepageResponse['summary'] = {
+    up: 0,
+    down: 0,
+    maintenance: 0,
+    paused: 0,
+    unknown: 0,
+  };
+
+  for (let index = 0; index < rawMonitors.length; index += 1) {
+    const row = rawMonitors[index];
+    if (!row) continue;
+
+    const presentation = computeHomepageMonitorPresentation(row, now, maintenanceMonitorIds);
+    summary[presentation.status] += 1;
+  }
+
+  if (selectedRows.length === 0) {
+    return {
+      monitors: [],
+      monitorCountTotal,
+      summary,
+      overallStatus: computeOverallStatus(summary),
+      uptimeRatingLevel,
+    };
+  }
+
+  const monitors = await buildHomepageMonitorCardsFromRows(
+    db,
+    now,
+    selectedRows,
+    maintenanceMonitorIds,
+  );
+
   return {
     monitors,
+    monitorCountTotal,
     summary,
     overallStatus: computeOverallStatus(summary),
     uptimeRatingLevel,
@@ -580,26 +787,106 @@ async function findLatestVisibleHistoricalMaintenanceWindow(
   }
 }
 
+export async function readHomepageHistoryPreviews(
+  db: D1Database,
+  now: number,
+): Promise<{
+  resolvedIncidentPreview: IncidentSummary | null;
+  maintenanceHistoryPreview: MaintenancePreview | null;
+}> {
+  const includeHiddenMonitors = false;
+  const [resolvedIncidentPreview, maintenanceHistoryPreview] = await Promise.all([
+    findLatestVisibleResolvedIncident(db, includeHiddenMonitors),
+    findLatestVisibleHistoricalMaintenanceWindow(db, now, includeHiddenMonitors),
+  ]);
+
+  return {
+    resolvedIncidentPreview: resolvedIncidentPreview
+      ? toIncidentSummary(resolvedIncidentPreview)
+      : null,
+    maintenanceHistoryPreview: maintenanceHistoryPreview
+      ? toMaintenancePreview(maintenanceHistoryPreview.row, maintenanceHistoryPreview.monitorIds)
+      : null,
+  };
+}
+
+export function homepageFromStatusPayload(
+  status: PublicStatusResponse,
+  previews: {
+    resolvedIncidentPreview?: IncidentSummary | null;
+    maintenanceHistoryPreview?: MaintenancePreview | null;
+  } = {},
+): PublicHomepageResponse {
+  return {
+    generated_at: status.generated_at,
+    bootstrap_mode: 'full',
+    monitor_count_total: status.monitors.length,
+    site_title: status.site_title,
+    site_description: status.site_description,
+    site_locale: status.site_locale,
+    site_timezone: status.site_timezone,
+    uptime_rating_level: status.uptime_rating_level,
+    overall_status: status.overall_status,
+    banner: status.banner,
+    summary: status.summary,
+    monitors: status.monitors.map((monitor) => ({
+      id: monitor.id,
+      name: monitor.name,
+      type: monitor.type,
+      group_name: monitor.group_name,
+      status: monitor.status,
+      is_stale: monitor.is_stale,
+      last_checked_at: monitor.last_checked_at,
+      heartbeat_strip: {
+        checked_at: monitor.heartbeats.map((heartbeat) => heartbeat.checked_at),
+        status_codes: monitor.heartbeats
+          .map((heartbeat) => toHeartbeatStatusCode(heartbeat.status))
+          .join(''),
+        latency_ms: monitor.heartbeats.map((heartbeat) => heartbeat.latency_ms),
+      },
+      uptime_30d: monitor.uptime_30d ? { uptime_pct: monitor.uptime_30d.uptime_pct } : null,
+      uptime_day_strip: {
+        day_start_at: monitor.uptime_days.map((day) => day.day_start_at),
+        downtime_sec: monitor.uptime_days.map((day) => day.downtime_sec),
+        unknown_sec: monitor.uptime_days.map((day) => day.unknown_sec),
+        uptime_pct_milli: monitor.uptime_days.map((day) =>
+          day.uptime_pct === null ? null : Math.round(day.uptime_pct * 1000),
+        ),
+      },
+    })),
+    active_incidents: status.active_incidents.map(incidentSummaryFromStatusIncident),
+    maintenance_windows: {
+      active: status.maintenance_windows.active.map(maintenancePreviewFromStatusWindow),
+      upcoming: status.maintenance_windows.upcoming.map(maintenancePreviewFromStatusWindow),
+    },
+    resolved_incident_preview: previews.resolvedIncidentPreview ?? null,
+    maintenance_history_preview: previews.maintenanceHistoryPreview ?? null,
+  };
+}
+
 export async function computePublicHomepagePayload(
   db: D1Database,
   now: number,
 ): Promise<PublicHomepageResponse> {
   const includeHiddenMonitors = false;
+  const settingsPromise = readPublicSiteSettings(db);
 
   const [
+    settings,
     monitorData,
     activeIncidents,
     maintenanceWindows,
-    settings,
-    resolvedIncidentPreview,
-    maintenanceHistoryPreview,
+    historyPreviews,
   ] = await Promise.all([
-    buildHomepageMonitorData(db, now, includeHiddenMonitors),
+    settingsPromise,
+    settingsPromise.then((settings) =>
+      buildHomepageMonitorData(db, now, includeHiddenMonitors, {
+        uptimeRatingLevel: settings.uptime_rating_level,
+      }),
+    ),
     listVisibleActiveIncidents(db, includeHiddenMonitors),
     listVisibleMaintenanceWindows(db, now, includeHiddenMonitors),
-    readPublicSiteSettings(db),
-    findLatestVisibleResolvedIncident(db, includeHiddenMonitors),
-    findLatestVisibleHistoricalMaintenanceWindow(db, now, includeHiddenMonitors),
+    readHomepageHistoryPreviews(db, now),
   ]);
 
   const activeIncidentSummaries = new Array<IncidentSummary>(activeIncidents.length);
@@ -628,7 +915,7 @@ export async function computePublicHomepagePayload(
   return {
     generated_at: now,
     bootstrap_mode: 'full',
-    monitor_count_total: monitorData.monitors.length,
+    monitor_count_total: monitorData.monitorCountTotal,
     site_title: settings.site_title,
     site_description: settings.site_description,
     site_locale: settings.site_locale,
@@ -648,11 +935,67 @@ export async function computePublicHomepagePayload(
       active: activeMaintenancePreview,
       upcoming: upcomingMaintenancePreview,
     },
-    resolved_incident_preview: resolvedIncidentPreview
-      ? toIncidentSummary(resolvedIncidentPreview)
-      : null,
-    maintenance_history_preview: maintenanceHistoryPreview
-      ? toMaintenancePreview(maintenanceHistoryPreview.row, maintenanceHistoryPreview.monitorIds)
-      : null,
+    resolved_incident_preview: historyPreviews.resolvedIncidentPreview,
+    maintenance_history_preview: historyPreviews.maintenanceHistoryPreview,
+  };
+}
+
+export async function computePublicHomepageArtifactPayload(
+  db: D1Database,
+  now: number,
+): Promise<PublicHomepageResponse> {
+  const includeHiddenMonitors = false;
+  const settingsPromise = readPublicSiteSettings(db);
+  const bootstrapRowsPromise = listHomepageMonitorRows(db, includeHiddenMonitors, 12);
+  const [settings, summaryData, bootstrapRows, activeIncidents, maintenanceWindows, historyPreviews] =
+    await Promise.all([
+      settingsPromise,
+      readHomepageMonitorSummary(db, now, includeHiddenMonitors),
+      bootstrapRowsPromise,
+      listVisibleActiveIncidents(db, includeHiddenMonitors),
+      listVisibleMaintenanceWindows(db, now, includeHiddenMonitors),
+      readHomepageHistoryPreviews(db, now),
+    ]);
+  const maintenanceMonitorIds = await listHomepageMaintenanceMonitorIds(
+    db,
+    now,
+    bootstrapRows.map((row) => row.id),
+  );
+  const monitors = await buildHomepageMonitorCardsFromRows(
+    db,
+    now,
+    bootstrapRows,
+    maintenanceMonitorIds,
+  );
+
+  return {
+    generated_at: now,
+    bootstrap_mode: summaryData.monitorCountTotal > monitors.length ? 'partial' : 'full',
+    monitor_count_total: summaryData.monitorCountTotal,
+    site_title: settings.site_title,
+    site_description: settings.site_description,
+    site_locale: settings.site_locale,
+    site_timezone: settings.site_timezone,
+    uptime_rating_level: settings.uptime_rating_level,
+    overall_status: summaryData.overallStatus,
+    banner: buildPublicStatusBanner({
+      counts: summaryData.summary,
+      monitorCount: summaryData.monitorCountTotal,
+      activeIncidents,
+      activeMaintenanceWindows: maintenanceWindows.active,
+    }),
+    summary: summaryData.summary,
+    monitors,
+    active_incidents: activeIncidents.map(({ row }) => toIncidentSummary(row)),
+    maintenance_windows: {
+      active: maintenanceWindows.active.map(({ row, monitorIds }) =>
+        toMaintenancePreview(row, monitorIds),
+      ),
+      upcoming: maintenanceWindows.upcoming.map(({ row, monitorIds }) =>
+        toMaintenancePreview(row, monitorIds),
+      ),
+    },
+    resolved_incident_preview: historyPreviews.resolvedIncidentPreview,
+    maintenance_history_preview: historyPreviews.maintenanceHistoryPreview,
   };
 }

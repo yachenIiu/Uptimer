@@ -290,7 +290,7 @@ export function buildHomepageRenderArtifact(
     allMonitorNames.set(monitor.id, monitor.name);
   }
   const bootstrapSnapshot =
-    snapshot.monitors.length > MAX_BOOTSTRAP_MONITORS
+    snapshot.bootstrap_mode === 'partial' || snapshot.monitors.length > MAX_BOOTSTRAP_MONITORS
       ? {
           ...snapshot,
           bootstrap_mode: 'partial' as const,
@@ -692,6 +692,34 @@ export async function readHomepageSnapshotGeneratedAt(
   return row?.generated_at ?? null;
 }
 
+export async function readHomepageArtifactSnapshotGeneratedAt(
+  db: D1Database,
+): Promise<number | null> {
+  const row = await readHomepageArtifactSnapshotRow(db);
+  return row?.generated_at ?? null;
+}
+
+function homepageSnapshotUpsertStatement(
+  db: D1Database,
+  key: string,
+  generatedAt: number,
+  bodyJson: string,
+  now: number,
+): D1PreparedStatement {
+  return db
+    .prepare(
+      `
+      INSERT INTO public_snapshots (key, generated_at, body_json, updated_at)
+      VALUES (?1, ?2, ?3, ?4)
+      ON CONFLICT(key) DO UPDATE SET
+        generated_at = excluded.generated_at,
+        body_json = excluded.body_json,
+        updated_at = excluded.updated_at
+    `,
+    )
+    .bind(key, generatedAt, bodyJson, now);
+}
+
 export async function writeHomepageSnapshot(
   db: D1Database,
   now: number,
@@ -701,19 +729,33 @@ export async function writeHomepageSnapshot(
   const dataBodyJson = JSON.stringify(payload);
   const renderBodyJson = JSON.stringify(render);
 
-  const upsertSql = `
-    INSERT INTO public_snapshots (key, generated_at, body_json, updated_at)
-    VALUES (?1, ?2, ?3, ?4)
-    ON CONFLICT(key) DO UPDATE SET
-      generated_at = excluded.generated_at,
-      body_json = excluded.body_json,
-      updated_at = excluded.updated_at
-  `;
-
   await db.batch([
-    db.prepare(upsertSql).bind(SNAPSHOT_KEY, payload.generated_at, dataBodyJson, now),
-    db.prepare(upsertSql).bind(SNAPSHOT_ARTIFACT_KEY, render.generated_at, renderBodyJson, now),
+    homepageSnapshotUpsertStatement(db, SNAPSHOT_KEY, payload.generated_at, dataBodyJson, now),
+    homepageSnapshotUpsertStatement(
+      db,
+      SNAPSHOT_ARTIFACT_KEY,
+      render.generated_at,
+      renderBodyJson,
+      now,
+    ),
   ]);
+}
+
+export async function writeHomepageArtifactSnapshot(
+  db: D1Database,
+  now: number,
+  payload: PublicHomepageResponse,
+): Promise<void> {
+  const render = buildHomepageRenderArtifact(payload);
+  const renderBodyJson = JSON.stringify(render);
+
+  await homepageSnapshotUpsertStatement(
+    db,
+    SNAPSHOT_ARTIFACT_KEY,
+    render.generated_at,
+    renderBodyJson,
+    now,
+  ).run();
 }
 
 export function applyHomepageCacheHeaders(res: Response, ageSeconds: number): void {
@@ -744,6 +786,15 @@ export async function refreshPublicHomepageSnapshot(opts: {
   await writeHomepageSnapshot(opts.db, opts.now, payload);
 }
 
+export async function refreshPublicHomepageArtifactSnapshot(opts: {
+  db: D1Database;
+  now: number;
+  compute: () => Promise<unknown>;
+}): Promise<void> {
+  const payload = toHomepageSnapshotPayload(await opts.compute());
+  await writeHomepageArtifactSnapshot(opts.db, opts.now, payload);
+}
+
 export async function refreshPublicHomepageSnapshotIfNeeded(opts: {
   db: D1Database;
   now: number;
@@ -765,5 +816,29 @@ export async function refreshPublicHomepageSnapshotIfNeeded(opts: {
   }
 
   await refreshPublicHomepageSnapshot(opts);
+  return true;
+}
+
+export async function refreshPublicHomepageArtifactSnapshotIfNeeded(opts: {
+  db: D1Database;
+  now: number;
+  compute: () => Promise<unknown>;
+}): Promise<boolean> {
+  const generatedAt = await readHomepageArtifactSnapshotGeneratedAt(opts.db);
+  if (generatedAt !== null && isSameMinute(generatedAt, opts.now)) {
+    return false;
+  }
+
+  const acquired = await acquireLease(opts.db, REFRESH_LOCK_NAME, opts.now, 55);
+  if (!acquired) {
+    return false;
+  }
+
+  const latestGeneratedAt = await readHomepageArtifactSnapshotGeneratedAt(opts.db);
+  if (latestGeneratedAt !== null && isSameMinute(latestGeneratedAt, opts.now)) {
+    return false;
+  }
+
+  await refreshPublicHomepageArtifactSnapshot(opts);
   return true;
 }

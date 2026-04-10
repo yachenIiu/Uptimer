@@ -4,6 +4,14 @@ function hasAuthorizationHeader(req: { header?(name: string): string | undefined
   return Boolean(req.header?.('Authorization'));
 }
 
+function buildCacheKey(url: string, origin: string | undefined): Request {
+  const cacheUrl = new URL(url);
+  if (origin) {
+    cacheUrl.searchParams.set('__uptimer_origin_cache_key', origin);
+  }
+  return new Request(cacheUrl.toString(), { method: 'GET' });
+}
+
 // Cache public (unauthenticated) GET responses at the edge.
 // This reduces D1 read pressure and greatly improves TTFB on slow networks.
 //
@@ -19,7 +27,7 @@ export function cachePublic(opts: { cacheName: string; maxAgeSeconds: number }):
     }
 
     const cache = await caches.open(opts.cacheName);
-    const cacheKey = new Request(c.req.url, { method: 'GET' });
+    const cacheKey = buildCacheKey(c.req.url, c.req.header('Origin'));
 
     const cached = await cache.match(cacheKey);
     if (cached) return cached;

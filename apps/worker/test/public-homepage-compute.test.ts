@@ -30,10 +30,6 @@ describe('computePublicHomepagePayload', () => {
         all: () => [],
       },
       {
-        match: (sql) => sql.startsWith('select value from settings where key = ?1'),
-        first: () => ({ value: '4' }),
-      },
-      {
         match: 'row_number() over',
         all: () => [
           {
@@ -78,6 +74,7 @@ describe('computePublicHomepagePayload', () => {
           { key: 'site_description', value: 'Production services' },
           { key: 'site_locale', value: 'en' },
           { key: 'site_timezone', value: 'UTC' },
+          { key: 'uptime_rating_level', value: '4' },
         ],
       },
       {

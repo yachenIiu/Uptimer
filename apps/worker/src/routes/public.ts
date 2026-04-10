@@ -5,6 +5,10 @@ import { getDb, monitors } from '@uptimer/db';
 
 import type { Env } from '../env';
 import { hasValidAdminTokenRequest } from '../middleware/auth';
+import {
+  homepageFromStatusPayload,
+  readHomepageHistoryPreviews,
+} from '../public/homepage';
 import { computePublicStatusPayload } from '../public/status';
 import {
   buildNumberedPlaceholders,
@@ -22,8 +26,8 @@ import {
   readHomepageSnapshotArtifactJson,
   readHomepageSnapshotJson,
   readStatusSnapshot,
+  readStaleHomepageSnapshot,
   readStaleHomepageSnapshotArtifactJson,
-  readStaleHomepageSnapshotJson,
   toSnapshotPayload,
   writeStatusSnapshot,
 } from '../snapshots';
@@ -539,41 +543,85 @@ publicRoutes.get('/homepage', async (c) => {
   const now = Math.floor(Date.now() / 1000);
   const snapshot = await readHomepageSnapshotJson(c.env.DB, now);
   if (snapshot) {
-    const res = new Response(snapshot.bodyJson, {
-      headers: { 'Content-Type': 'application/json; charset=utf-8' },
-    });
+    c.header('Content-Type', 'application/json; charset=utf-8');
+    const res = c.body(snapshot.bodyJson);
     applyHomepageCacheHeaders(res, snapshot.age);
     return res;
   }
 
-  const stale = await readStaleHomepageSnapshotJson(c.env.DB, now);
-  if (stale) {
-    const res = new Response(stale.bodyJson, {
-      headers: { 'Content-Type': 'application/json; charset=utf-8' },
-    });
-    applyHomepageCacheHeaders(res, Math.min(60, stale.age));
+  const historyPreviewsPromise = readHomepageHistoryPreviews(c.env.DB, now).catch((err) => {
+    console.warn('public homepage: preview read failed', err);
+    return {
+      resolvedIncidentPreview: null,
+      maintenanceHistoryPreview: null,
+    };
+  });
+  const statusSnapshot = await readStatusSnapshot(c.env.DB, now);
+  if (statusSnapshot) {
+    const payload = homepageFromStatusPayload(
+      statusSnapshot.data,
+      await historyPreviewsPromise,
+    );
+    const res = c.json(payload);
+    applyHomepageCacheHeaders(res, statusSnapshot.age);
     return res;
   }
 
-  throw new AppError(503, 'UNAVAILABLE', 'Homepage snapshot unavailable');
+  try {
+    const statusPayload = await computePublicStatusPayload(c.env.DB, now);
+    const payload = homepageFromStatusPayload(statusPayload, await historyPreviewsPromise);
+    const res = c.json(payload);
+    applyHomepageCacheHeaders(res, 0);
+
+    c.executionCtx.waitUntil(
+      writeStatusSnapshot(c.env.DB, now, statusPayload).catch((err) => {
+        console.warn('public snapshot: write failed', err);
+      }),
+    );
+
+    return res;
+  } catch (err) {
+    console.warn('public homepage: secondary status compute failed', err);
+
+    const staleHomepage = await readStaleHomepageSnapshot(c.env.DB, now);
+    if (staleHomepage) {
+      const res = c.json(staleHomepage.data);
+      applyHomepageCacheHeaders(res, Math.min(60, staleHomepage.age));
+      return res;
+    }
+
+    const staleStatus = await readStaleStatusSnapshot(c.env.DB, now, 10 * 60);
+    if (staleStatus) {
+      const payload = homepageFromStatusPayload(
+        toSnapshotPayload(staleStatus.data),
+        await historyPreviewsPromise.catch(() => ({
+          resolvedIncidentPreview: null,
+          maintenanceHistoryPreview: null,
+        })),
+      );
+      const res = c.json(payload);
+      applyHomepageCacheHeaders(res, Math.min(60, staleStatus.age));
+      return res;
+    }
+
+    throw new AppError(503, 'UNAVAILABLE', 'Homepage unavailable');
+  }
 });
 
 publicRoutes.get('/homepage-artifact', async (c) => {
   const now = Math.floor(Date.now() / 1000);
   const snapshot = await readHomepageSnapshotArtifactJson(c.env.DB, now);
   if (snapshot) {
-    const res = new Response(snapshot.bodyJson, {
-      headers: { 'Content-Type': 'application/json; charset=utf-8' },
-    });
+    c.header('Content-Type', 'application/json; charset=utf-8');
+    const res = c.body(snapshot.bodyJson);
     applyHomepageCacheHeaders(res, snapshot.age);
     return res;
   }
 
   const stale = await readStaleHomepageSnapshotArtifactJson(c.env.DB, now);
   if (stale) {
-    const res = new Response(stale.bodyJson, {
-      headers: { 'Content-Type': 'application/json; charset=utf-8' },
-    });
+    c.header('Content-Type', 'application/json; charset=utf-8');
+    const res = c.body(stale.bodyJson);
     applyHomepageCacheHeaders(res, Math.min(60, stale.age));
     return res;
   }
