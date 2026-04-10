@@ -741,6 +741,22 @@ export async function writeHomepageSnapshot(
   ]);
 }
 
+export async function writeHomepageDataSnapshot(
+  db: D1Database,
+  now: number,
+  payload: PublicHomepageResponse,
+): Promise<void> {
+  const dataBodyJson = JSON.stringify(payload);
+
+  await homepageSnapshotUpsertStatement(
+    db,
+    SNAPSHOT_KEY,
+    payload.generated_at,
+    dataBodyJson,
+    now,
+  ).run();
+}
+
 export async function writeHomepageArtifactSnapshot(
   db: D1Database,
   now: number,

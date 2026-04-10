@@ -19,6 +19,7 @@ import {
   refreshPublicHomepageSnapshotIfNeeded,
   toHomepageSnapshotPayload,
   writeHomepageArtifactSnapshot,
+  writeHomepageDataSnapshot,
   writeHomepageSnapshot,
 } from '../src/snapshots/public-homepage';
 import { createFakeD1Database } from './helpers/fake-d1';
@@ -409,5 +410,23 @@ describe('snapshots/public-homepage', () => {
     expect(writtenArgs).toEqual([
       ['homepage:artifact', now, JSON.stringify(buildHomepageRenderArtifact(payload)), now],
     ]);
+  });
+
+  it('writes data-only homepage snapshots without touching the artifact row', async () => {
+    const boundArgs: unknown[][] = [];
+    const db = createFakeD1Database([
+      {
+        match: 'insert into public_snapshots',
+        run: (args) => {
+          boundArgs.push(args);
+          return { meta: { changes: 1 } };
+        },
+      },
+    ]);
+
+    const payload = samplePayload(280);
+    await writeHomepageDataSnapshot(db, 300, payload);
+
+    expect(boundArgs).toEqual([['homepage', 280, JSON.stringify(payload), 300]]);
   });
 });

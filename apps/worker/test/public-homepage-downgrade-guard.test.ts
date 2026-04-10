@@ -1,13 +1,20 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 
-const { computePublicStatusPayload } = vi.hoisted(() => ({
-  computePublicStatusPayload: vi.fn(),
+const { computePublicHomepagePayload } = vi.hoisted(() => ({
+  computePublicHomepagePayload: vi.fn(),
 }));
 
-vi.mock('../src/public/status', () => ({
-  computePublicStatusPayload,
-}));
+vi.mock('../src/public/homepage', async () => {
+  const actual = await vi.importActual<typeof import('../src/public/homepage')>(
+    '../src/public/homepage',
+  );
+
+  return {
+    ...actual,
+    computePublicHomepagePayload,
+  };
+});
 
 import type { Env } from '../src/env';
 import { handleError, handleNotFound } from '../src/middleware/errors';
@@ -115,14 +122,16 @@ describe('public homepage downgrade guard', () => {
     }
 
     vi.restoreAllMocks();
-    computePublicStatusPayload.mockReset();
+    computePublicHomepagePayload.mockReset();
   });
 
   it('keeps a recent homepage artifact when live status compute would downgrade it to unknown', async () => {
     vi.spyOn(Date, 'now').mockReturnValue(260_000);
-    let statusSnapshotWrites = 0;
-    computePublicStatusPayload.mockResolvedValue({
+    let homepageSnapshotWrites = 0;
+    computePublicHomepagePayload.mockResolvedValue({
       generated_at: 260,
+      bootstrap_mode: 'full',
+      monitor_count_total: 40,
       site_title: 'Status Hub',
       site_description: 'Production services',
       site_locale: 'en',
@@ -147,6 +156,8 @@ describe('public homepage downgrade guard', () => {
         active: [],
         upcoming: [],
       },
+      resolved_incident_preview: null,
+      maintenance_history_preview: null,
     });
 
     const { res } = await requestHomepage([
@@ -173,7 +184,7 @@ describe('public homepage downgrade guard', () => {
       {
         match: 'insert into public_snapshots',
         run: () => {
-          statusSnapshotWrites += 1;
+          homepageSnapshotWrites += 1;
           return 1;
         },
       },
@@ -191,15 +202,17 @@ describe('public homepage downgrade guard', () => {
         unknown: 0,
       },
     });
-    expect(computePublicStatusPayload).toHaveBeenCalledOnce();
-    expect(statusSnapshotWrites).toBe(0);
+    expect(computePublicHomepagePayload).toHaveBeenCalledOnce();
+    expect(homepageSnapshotWrites).toBe(0);
   });
 
   it('still upgrades to computed homepage data when the live status payload is healthy', async () => {
     vi.spyOn(Date, 'now').mockReturnValue(260_000);
-    let statusSnapshotWrites = 0;
-    computePublicStatusPayload.mockResolvedValue({
+    let homepageSnapshotWrites = 0;
+    computePublicHomepagePayload.mockResolvedValue({
       generated_at: 260,
+      bootstrap_mode: 'full',
+      monitor_count_total: 40,
       site_title: 'Status Hub',
       site_description: 'Production services',
       site_locale: 'en',
@@ -225,6 +238,8 @@ describe('public homepage downgrade guard', () => {
         active: [],
         upcoming: [],
       },
+      resolved_incident_preview: null,
+      maintenance_history_preview: null,
     });
 
     const { res } = await requestHomepage([
@@ -243,17 +258,9 @@ describe('public homepage downgrade guard', () => {
       {
         match: 'insert into public_snapshots',
         run: () => {
-          statusSnapshotWrites += 1;
+          homepageSnapshotWrites += 1;
           return 1;
         },
-      },
-      {
-        match: 'from incidents',
-        all: () => [],
-      },
-      {
-        match: 'from maintenance_windows',
-        all: () => [],
       },
     ]);
 
@@ -269,7 +276,7 @@ describe('public homepage downgrade guard', () => {
         unknown: 0,
       },
     });
-    expect(computePublicStatusPayload).toHaveBeenCalledOnce();
-    expect(statusSnapshotWrites).toBe(1);
+    expect(computePublicHomepagePayload).toHaveBeenCalledOnce();
+    expect(homepageSnapshotWrites).toBe(1);
   });
 });

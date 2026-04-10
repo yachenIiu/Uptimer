@@ -51,6 +51,17 @@ type RouteReadSample = {
   bodyKB: number;
 };
 
+type HomepageHotPathScenario = {
+  name: string;
+  mode: 'direct-homepage-compute';
+  monitorCount: number;
+};
+
+type HomepageHotPathSample = {
+  elapsedMs: number;
+  bodyKB: number;
+};
+
 const BENCH_LABEL = process.env.HOMEPAGE_BENCH_LABEL ?? 'current-working-tree';
 const OUTPUT_PATH = process.env.HOMEPAGE_BENCH_OUTPUT ?? null;
 
@@ -70,6 +81,19 @@ const ROUTE_READ_SCENARIOS: RouteReadScenario[] = [
   { name: 'homepage / 1000 monitors', endpoint: 'homepage', monitorCount: 1000 },
   { name: 'homepage-artifact / 250 monitors', endpoint: 'homepage-artifact', monitorCount: 250 },
   { name: 'homepage-artifact / 1000 monitors', endpoint: 'homepage-artifact', monitorCount: 1000 },
+];
+
+const HOMEPAGE_HOT_PATH_SCENARIOS: HomepageHotPathScenario[] = [
+  {
+    name: 'homepage via direct homepage compute / 250 monitors',
+    mode: 'direct-homepage-compute',
+    monitorCount: 250,
+  },
+  {
+    name: 'homepage via direct homepage compute / 1000 monitors',
+    mode: 'direct-homepage-compute',
+    monitorCount: 1000,
+  },
 ];
 
 function parsePositiveIntEnv(name: string, fallback: number): number {
@@ -136,7 +160,14 @@ function getScenarioRows(scenario: Scenario, now: number) {
   return built;
 }
 
-function createDbForScenario(scenario: Scenario, now: number) {
+function createHandlersForScenario(scenario: Scenario, now: number): {
+  handlers: FakeD1QueryHandler[];
+  rowCounts: {
+    monitorCount: number;
+    heartbeatRows: number;
+    rollupRows: number;
+  };
+} {
   const rows = getScenarioRows(scenario, now);
 
   const handlers: FakeD1QueryHandler[] = [
@@ -171,8 +202,21 @@ function createDbForScenario(scenario: Scenario, now: number) {
       all: () => rows.heartbeats,
     },
     {
+      match: 'select monitor_id, checked_at, status from check_results',
+      all: () =>
+        rows.heartbeats.map((row) => ({
+          monitor_id: row.monitor_id,
+          checked_at: row.checked_at,
+          status: row.status,
+        })),
+    },
+    {
       match: 'from monitor_daily_rollups',
       all: () => rows.rollups,
+    },
+    {
+      match: 'from outages',
+      all: () => [],
     },
     {
       match: (sql) => sql.startsWith('select key, value from settings'),
@@ -194,12 +238,20 @@ function createDbForScenario(scenario: Scenario, now: number) {
   ];
 
   return {
-    db: createFakeD1Database(handlers),
+    handlers,
     rowCounts: {
       monitorCount: rows.monitors.length,
       heartbeatRows: rows.heartbeats.length,
       rollupRows: rows.rollups.length,
     },
+  };
+}
+
+function createDbForScenario(scenario: Scenario, now: number) {
+  const { handlers, rowCounts } = createHandlersForScenario(scenario, now);
+  return {
+    db: createFakeD1Database(handlers),
+    rowCounts,
   };
 }
 
@@ -479,12 +531,120 @@ function summarizeRouteRead(scenario: RouteReadScenario, samples: RouteReadSampl
   };
 }
 
+async function runOneHomepageHotPath(
+  scenario: HomepageHotPathScenario,
+): Promise<HomepageHotPathSample> {
+  const now = 1_728_000_000;
+  const originalCaches = globalThis.caches;
+
+  Object.defineProperty(globalThis, 'caches', {
+    configurable: true,
+    value: {
+      open: async () => ({
+        match: async () => undefined,
+        put: async () => undefined,
+      }),
+    },
+  });
+
+  try {
+    const artifactPayload = buildSyntheticHomepagePayload(
+      Math.min(scenario.monitorCount, 12),
+      30,
+      14,
+      now,
+    );
+    const artifact = buildHomepageRenderArtifact({
+      ...artifactPayload,
+      bootstrap_mode: scenario.monitorCount > artifactPayload.monitors.length ? 'partial' : 'full',
+      monitor_count_total: scenario.monitorCount,
+    });
+    const scenarioShape: Scenario = {
+      name: scenario.name,
+      monitorCount: scenario.monitorCount,
+      heartbeatPoints: 30,
+      uptimeDays: 14,
+    };
+    const { handlers } = createHandlersForScenario(scenarioShape, now);
+    const liveHandlers = [
+      ...handlers,
+      {
+        match: 'insert into public_snapshots',
+        run: () => ({ meta: { changes: 1 } }),
+      } satisfies FakeD1QueryHandler,
+    ];
+    const env = {
+      DB: createFakeD1Database([
+        {
+          match: 'from public_snapshots',
+          first: (args) => {
+            if (args[0] === 'homepage') return null;
+            if (args[0] === 'homepage:artifact') {
+              return {
+                generated_at: now,
+                body_json: JSON.stringify(artifact),
+              };
+            }
+            return null;
+          },
+        },
+        ...liveHandlers,
+      ]),
+      ADMIN_TOKEN: 'test-admin-token',
+    } as unknown as Env;
+
+    const app = new Hono<{ Bindings: Env }>();
+    app.onError(handleError);
+    app.notFound(handleNotFound);
+    app.route('/api/v1/public', publicRoutes);
+
+    const started = performance.now();
+    const response = await app.fetch(
+      new Request('https://status.example.com/api/v1/public/homepage'),
+      env,
+      { waitUntil: () => undefined } as ExecutionContext,
+    );
+    const responseBody = await response.text();
+    const elapsedMs = performance.now() - started;
+    expect(response.ok).toBe(true);
+
+    return {
+      elapsedMs,
+      bodyKB: Number((responseBody.length / 1024).toFixed(1)),
+    };
+  } finally {
+    Object.defineProperty(globalThis, 'caches', {
+      configurable: true,
+      value: originalCaches,
+    });
+  }
+}
+
+function summarizeHomepageHotPath(
+  scenario: HomepageHotPathScenario,
+  samples: HomepageHotPathSample[],
+) {
+  const elapsed = samples.map((sample) => sample.elapsedMs).sort((a, b) => a - b);
+  const totalElapsed = elapsed.reduce((sum, value) => sum + value, 0);
+  const first = samples[0];
+
+  return {
+    scenario: scenario.name,
+    runs: samples.length,
+    meanMs: Number((totalElapsed / samples.length).toFixed(3)),
+    medianMs: Number(percentile(elapsed, 0.5).toFixed(3)),
+    p95Ms: Number(percentile(elapsed, 0.95).toFixed(3)),
+    bodyKB: first?.bodyKB ?? 0,
+  };
+}
+
 describe('homepage snapshot benchmark', () => {
   it('measures homepage snapshot compute cost', async () => {
     const rows = [];
     const artifactRows = [];
     const rootMissRows = [];
     const routeReadRows = [];
+    const hotPathRows = [];
 
     for (const scenario of SCENARIOS) {
       for (let index = 0; index < WARMUP_RUNS; index += 1) {
@@ -538,6 +698,19 @@ describe('homepage snapshot benchmark', () => {
       routeReadRows.push(summarizeRouteRead(scenario, samples));
     }
 
+    for (const scenario of HOMEPAGE_HOT_PATH_SCENARIOS) {
+      for (let index = 0; index < WARMUP_RUNS; index += 1) {
+        await runOneHomepageHotPath(scenario);
+      }
+
+      const samples: HomepageHotPathSample[] = [];
+      for (let index = 0; index < MEASURE_RUNS; index += 1) {
+        samples.push(await runOneHomepageHotPath(scenario));
+      }
+
+      hotPathRows.push(summarizeHomepageHotPath(scenario, samples));
+    }
+
     console.log('Homepage snapshot benchmark');
     console.log(`Label: ${BENCH_LABEL}`);
     if (process.env.HOMEPAGE_BENCH_RUNS || process.env.HOMEPAGE_BENCH_WARMUPS) {
@@ -556,6 +729,9 @@ describe('homepage snapshot benchmark', () => {
     console.log('');
     console.log('Worker homepage route read benchmark');
     console.table(routeReadRows);
+    console.log('');
+    console.log('Worker homepage hot path benchmark');
+    console.table(hotPathRows);
 
     if (OUTPUT_PATH) {
       await writeFile(
@@ -566,6 +742,7 @@ describe('homepage snapshot benchmark', () => {
             artifactCompute: artifactRows,
             rootMiss: rootMissRows,
             routeRead: routeReadRows,
+            hotPath: hotPathRows,
           },
           null,
           2,

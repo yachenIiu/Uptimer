@@ -34,6 +34,14 @@ function installCacheMock(store: CacheStore) {
 }
 
 async function requestHomepage(handlers: FakeD1QueryHandler[]) {
+  const { res } = await requestHomepageWithWaitUntil(handlers);
+  return res;
+}
+
+async function requestHomepageWithWaitUntil(
+  handlers: FakeD1QueryHandler[],
+  waitUntil = vi.fn(),
+) {
   const env = {
     DB: createFakeD1Database(handlers),
     ADMIN_TOKEN: 'test-admin-token',
@@ -44,11 +52,13 @@ async function requestHomepage(handlers: FakeD1QueryHandler[]) {
   app.notFound(handleNotFound);
   app.route('/api/v1/public', publicRoutes);
 
-  return app.fetch(
+  const res = await app.fetch(
     new Request('https://status.example.com/api/v1/public/homepage'),
     env,
-    { waitUntil: vi.fn() } as unknown as ExecutionContext,
+    { waitUntil } as unknown as ExecutionContext,
   );
+
+  return { res, waitUntil };
 }
 
 async function requestHomepageArtifact(handlers: FakeD1QueryHandler[]) {
@@ -443,6 +453,115 @@ describe('public homepage route', () => {
         },
       ],
     });
+  });
+
+  it('prefers direct homepage compute and writes only the homepage data row when the snapshot is missing', async () => {
+    const now = 1_728_000_000;
+    const writtenArgs: unknown[][] = [];
+    vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
+
+    const { res, waitUntil } = await requestHomepageWithWaitUntil(
+      [
+        {
+          match: 'from public_snapshots',
+          first: () => null,
+        },
+        {
+          match: 'from monitors m',
+          all: () => [
+            {
+              id: 1,
+              name: 'API',
+              type: 'http',
+              group_name: 'Core',
+              group_sort_order: 0,
+              sort_order: 0,
+              interval_sec: 60,
+              created_at: now - 40 * 86_400,
+              state_status: 'up',
+              last_checked_at: now - 30,
+            },
+          ],
+        },
+        {
+          match: 'select distinct mwm.monitor_id',
+          all: () => [],
+        },
+        {
+          match: 'row_number() over',
+          all: () => [
+            {
+              monitor_id: 1,
+              checked_at: now - 60,
+              status: 'up',
+              latency_ms: 42,
+            },
+          ],
+        },
+        {
+          match: 'from monitor_daily_rollups',
+          all: () => [
+            {
+              monitor_id: 1,
+              day_start_at: now - 86_400,
+              total_sec: 86_400,
+              downtime_sec: 0,
+              unknown_sec: 0,
+              uptime_sec: 86_400,
+            },
+          ],
+        },
+        {
+          match: (sql) => sql.startsWith('select key, value from settings'),
+          all: () => [
+            { key: 'site_title', value: 'Status Hub' },
+            { key: 'site_description', value: 'Production services' },
+            { key: 'site_locale', value: 'en' },
+            { key: 'site_timezone', value: 'UTC' },
+            { key: 'uptime_rating_level', value: '4' },
+          ],
+        },
+        {
+          match: 'from incidents',
+          all: () => [],
+        },
+        {
+          match: 'from maintenance_windows',
+          all: () => [],
+        },
+        {
+          match: 'insert into public_snapshots',
+          run: (args) => {
+            writtenArgs.push(args);
+            return { meta: { changes: 1 } };
+          },
+        },
+      ],
+      vi.fn((promise) => promise),
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      generated_at: now,
+      bootstrap_mode: 'full',
+      monitor_count_total: 1,
+      uptime_rating_level: 4,
+      monitors: [
+        {
+          id: 1,
+          heartbeat_strip: {
+            checked_at: [now - 60],
+            status_codes: 'u',
+            latency_ms: [42],
+          },
+        },
+      ],
+    });
+
+    expect(waitUntil).toHaveBeenCalledTimes(2);
+    await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+    expect(writtenArgs).toHaveLength(1);
+    expect(writtenArgs[0]?.[0]).toBe('homepage');
   });
 
   it('returns 503 when no homepage snapshot is available', async () => {
