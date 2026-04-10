@@ -55,7 +55,9 @@ function makeDueRows(count: number) {
     name: `Monitor ${index + 1}`,
     type: 'unsupported',
     target: `benchmark-target-${index + 1}`,
+    group_name: index % 2 === 0 ? 'Core' : 'Edge',
     interval_sec: 60,
+    created_at: 1_700_000_000 - 40 * 86_400,
     timeout_ms: 5000,
     http_method: null,
     http_headers_json: null,
@@ -83,6 +85,7 @@ function createEnvForScenario(scenario: Scenario): {
     waitUntilCalls: 0,
   };
   const dueRows = makeDueRows(scenario.monitorCount);
+  let homepageArtifactGeneratedAt = 0;
   const channels = scenario.withChannel
     ? [
         {
@@ -109,11 +112,22 @@ function createEnvForScenario(scenario: Scenario): {
     },
     {
       match: 'select key, value from settings',
-      all: () => [],
+      all: () => [
+        { key: 'site_title', value: 'Status Hub' },
+        { key: 'site_description', value: 'Production services' },
+        { key: 'site_locale', value: 'en' },
+        { key: 'site_timezone', value: 'UTC' },
+        { key: 'uptime_rating_level', value: '3' },
+      ],
     },
     {
       match: 'from monitors m',
-      all: () => dueRows,
+      all: (args, normalizedSql) => {
+        if (normalizedSql.includes('limit ?1')) {
+          return dueRows.slice(0, Number(args[0] ?? dueRows.length));
+        }
+        return dueRows;
+      },
     },
     {
       match: 'select distinct mwm.monitor_id',
@@ -126,6 +140,53 @@ function createEnvForScenario(scenario: Scenario): {
     {
       match: 'from maintenance_window_monitors',
       all: () => [],
+    },
+    {
+      match: 'with active_maintenance',
+      first: () => ({
+        monitor_count_total: dueRows.length,
+        up: dueRows.length,
+        down: 0,
+        maintenance: 0,
+        paused: 0,
+        unknown: 0,
+      }),
+    },
+    {
+      match: 'row_number() over',
+      all: () =>
+        dueRows.slice(0, 12).flatMap((row) =>
+          Array.from({ length: 30 }, (_, index) => ({
+            monitor_id: row.id,
+            checked_at: 1_700_000_000 - (index + 1) * 60,
+            status: 'up',
+            latency_ms: 40 + ((row.id + index) % 50),
+          })),
+        ),
+    },
+    {
+      match: 'from monitor_daily_rollups',
+      all: () =>
+        dueRows.slice(0, 12).flatMap((row) =>
+          Array.from({ length: 14 }, (_, index) => ({
+            monitor_id: row.id,
+            day_start_at: 1_700_000_000 - (14 - index) * 86_400,
+            total_sec: 86_400,
+            downtime_sec: 0,
+            unknown_sec: 0,
+            uptime_sec: 86_400,
+          })),
+        ),
+    },
+    {
+      match: 'from public_snapshots',
+      first: (args) =>
+        args[0] === 'homepage:artifact' && homepageArtifactGeneratedAt > 0
+          ? {
+              generated_at: homepageArtifactGeneratedAt,
+              body_json: '{"generated_at":0}',
+            }
+          : null,
     },
     {
       match: 'insert into check_results',
@@ -142,6 +203,15 @@ function createEnvForScenario(scenario: Scenario): {
     {
       match: 'update outages',
       run: () => ({ meta: { changes: 1 } }),
+    },
+    {
+      match: 'insert into public_snapshots',
+      run: (args) => {
+        if (args[0] === 'homepage:artifact') {
+          homepageArtifactGeneratedAt = Number(args[1]);
+        }
+        return { meta: { changes: 1 } };
+      },
     },
   ];
 
@@ -161,15 +231,19 @@ function createEnvForScenario(scenario: Scenario): {
 
 async function runOne(scenario: Scenario): Promise<Sample> {
   const { env, sampleState } = createEnvForScenario(scenario);
+  const waitUntilPromises: Promise<unknown>[] = [];
   const ctx = {
     waitUntil(promise: Promise<unknown>) {
       sampleState.waitUntilCalls += 1;
-      void promise.catch(() => undefined);
+      waitUntilPromises.push(
+        promise.catch(() => undefined),
+      );
     },
   } as unknown as ExecutionContext;
 
   const started = performance.now();
   await runScheduledTick(env, ctx);
+  await Promise.all(waitUntilPromises);
   const elapsedMs = performance.now() - started;
 
   return {
@@ -181,13 +255,16 @@ async function runOne(scenario: Scenario): Promise<Sample> {
 async function withMutedConsole<T>(fn: () => Promise<T>): Promise<T> {
   const originalLog = console.log;
   const originalError = console.error;
+  const originalWarn = console.warn;
   console.log = () => undefined;
   console.error = () => undefined;
+  console.warn = () => undefined;
   try {
     return await fn();
   } finally {
     console.log = originalLog;
     console.error = originalError;
+    console.warn = originalWarn;
   }
 }
 

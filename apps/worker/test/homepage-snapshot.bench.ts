@@ -3,7 +3,10 @@ import { writeFile } from 'node:fs/promises';
 import { Hono } from 'hono';
 import { describe, expect, it } from 'vitest';
 
-import { computePublicHomepagePayload } from '../src/public/homepage';
+import {
+  computePublicHomepageArtifactPayload,
+  computePublicHomepagePayload,
+} from '../src/public/homepage';
 import type { Env } from '../src/env';
 import { handleError, handleNotFound } from '../src/middleware/errors';
 import { publicRoutes } from '../src/routes/public';
@@ -139,7 +142,21 @@ function createDbForScenario(scenario: Scenario, now: number) {
   const handlers: FakeD1QueryHandler[] = [
     {
       match: 'from monitors m',
-      all: () => rows.monitors,
+      all: (args, normalizedSql) =>
+        normalizedSql.includes('limit ?1')
+          ? rows.monitors.slice(0, Number(args[0] ?? rows.monitors.length))
+          : rows.monitors,
+    },
+    {
+      match: 'with active_maintenance',
+      first: () => ({
+        monitor_count_total: rows.monitors.length,
+        up: rows.monitors.length,
+        down: 0,
+        maintenance: 0,
+        paused: 0,
+        unknown: 0,
+      }),
     },
     {
       match: 'select distinct mwm.monitor_id',
@@ -195,6 +212,23 @@ async function runOne(scenario: Scenario): Promise<Sample> {
   const elapsedMs = performance.now() - started;
 
   expect(payload.monitors).toHaveLength(scenario.monitorCount);
+
+  return {
+    elapsedMs,
+    ...rowCounts,
+  };
+}
+
+async function runOneArtifactCompute(scenario: Scenario): Promise<Sample> {
+  const now = 1_728_000_000;
+  const { db, rowCounts } = createDbForScenario(scenario, now);
+
+  const started = performance.now();
+  const payload = await computePublicHomepageArtifactPayload(db, now);
+  const elapsedMs = performance.now() - started;
+
+  expect(payload.monitors.length).toBeLessThanOrEqual(12);
+  expect(payload.monitor_count_total).toBe(scenario.monitorCount);
 
   return {
     elapsedMs,
@@ -369,7 +403,7 @@ function summarizeRootMiss(scenario: RootMissScenario, samples: RootMissSample[]
 }
 
 async function runOneRouteRead(scenario: RouteReadScenario): Promise<RouteReadSample> {
-  const now = 1_728_000_000;
+  const now = Math.floor(Date.now() / 1000);
   const payload = buildSyntheticHomepagePayload(scenario.monitorCount, 30, 14, now);
   const artifact = buildHomepageRenderArtifact(payload);
   const bodyJson = scenario.endpoint === 'homepage' ? JSON.stringify(payload) : JSON.stringify(artifact);
@@ -414,12 +448,13 @@ async function runOneRouteRead(scenario: RouteReadScenario): Promise<RouteReadSa
       env,
       { waitUntil: () => undefined } as ExecutionContext,
     );
-    await response.text();
+    const responseBody = await response.text();
     const elapsedMs = performance.now() - started;
+    expect(response.ok).toBe(true);
 
     return {
       elapsedMs,
-      bodyKB: Number((bodyJson.length / 1024).toFixed(1)),
+      bodyKB: Number((responseBody.length / 1024).toFixed(1)),
     };
   } finally {
     Object.defineProperty(globalThis, 'caches', {
@@ -447,6 +482,7 @@ function summarizeRouteRead(scenario: RouteReadScenario, samples: RouteReadSampl
 describe('homepage snapshot benchmark', () => {
   it('measures homepage snapshot compute cost', async () => {
     const rows = [];
+    const artifactRows = [];
     const rootMissRows = [];
     const routeReadRows = [];
 
@@ -461,6 +497,19 @@ describe('homepage snapshot benchmark', () => {
       }
 
       rows.push(summarize(scenario, samples));
+    }
+
+    for (const scenario of SCENARIOS) {
+      for (let index = 0; index < WARMUP_RUNS; index += 1) {
+        await runOneArtifactCompute(scenario);
+      }
+
+      const samples: Sample[] = [];
+      for (let index = 0; index < MEASURE_RUNS; index += 1) {
+        samples.push(await runOneArtifactCompute(scenario));
+      }
+
+      artifactRows.push(summarize(scenario, samples));
     }
 
     for (const scenario of ROOT_MISS_SCENARIOS) {
@@ -499,6 +548,9 @@ describe('homepage snapshot benchmark', () => {
     console.log('');
     console.table(rows);
     console.log('');
+    console.log('Homepage artifact bootstrap compute benchmark');
+    console.table(artifactRows);
+    console.log('');
     console.log('Pages homepage root miss benchmark');
     console.table(rootMissRows);
     console.log('');
@@ -508,7 +560,16 @@ describe('homepage snapshot benchmark', () => {
     if (OUTPUT_PATH) {
       await writeFile(
         OUTPUT_PATH,
-        JSON.stringify({ snapshotCompute: rows, rootMiss: rootMissRows, routeRead: routeReadRows }, null, 2),
+        JSON.stringify(
+          {
+            snapshotCompute: rows,
+            artifactCompute: artifactRows,
+            rootMiss: rootMissRows,
+            routeRead: routeReadRows,
+          },
+          null,
+          2,
+        ),
         'utf8',
       );
       console.log(`Wrote raw benchmark data to ${OUTPUT_PATH}`);
