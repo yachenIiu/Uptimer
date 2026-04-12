@@ -19,11 +19,24 @@ function buildCacheKey(url: string, origin: string | undefined): Request {
 // public endpoints can return admin-only payloads when a valid bearer token is present.
 // If a handler already set Cache-Control, we respect it (do not override).
 // This allows endpoints like `/public/status` to precisely control freshness (<= 60s).
-export function cachePublic(opts: { cacheName: string; maxAgeSeconds: number }): MiddlewareHandler {
+export function cachePublic(opts: {
+  cacheName: string;
+  maxAgeSeconds: number;
+  skipPathnames?: readonly string[];
+}): MiddlewareHandler {
   return async (c, next) => {
     if (c.req.method !== 'GET' || hasAuthorizationHeader(c.req)) {
       await next();
       return;
+    }
+
+    const skipPathnames = opts.skipPathnames ?? [];
+    if (skipPathnames.length > 0) {
+      const pathname = new URL(c.req.url).pathname;
+      if (skipPathnames.includes(pathname)) {
+        await next();
+        return;
+      }
     }
 
     const cache = await caches.open(opts.cacheName);

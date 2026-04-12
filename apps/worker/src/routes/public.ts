@@ -28,6 +28,7 @@ import {
   readStatusSnapshot,
   readStatusSnapshotJson,
   readStaleHomepageSnapshot,
+  readStaleHomepageSnapshotJson,
   readStaleHomepageSnapshotArtifact,
   readStaleHomepageSnapshotArtifactJson,
   toSnapshotPayload,
@@ -156,7 +157,16 @@ async function readStaleStatusSnapshot(
 export const publicRoutes = new Hono<{ Bindings: Env }>();
 
 // Cache public endpoints at the edge to improve performance on slow networks.
-publicRoutes.use('*', cachePublic({ cacheName: 'uptimer-public', maxAgeSeconds: 30 }));
+publicRoutes.use(
+  '*',
+  cachePublic({
+    cacheName: 'uptimer-public',
+    maxAgeSeconds: 30,
+    // Homepage payloads can be large; caching them via Cache API can add CPU due to body cloning.
+    // Prefer serving the precomputed D1 snapshot directly.
+    skipPathnames: ['/api/v1/public/homepage'],
+  }),
+);
 
 const latencyRangeSchema = z.enum(['24h']);
 const uptimeRangeSchema = z.enum(['24h', '7d', '30d']);
@@ -583,6 +593,16 @@ publicRoutes.get('/homepage', async (c) => {
     c.header('Content-Type', 'application/json; charset=utf-8');
     const res = c.body(snapshot.bodyJson);
     applyHomepageCacheHeaders(res, snapshot.age);
+    return res;
+  }
+
+  // If the full homepage snapshot is stale, prefer serving it over recomputing in the hot path.
+  // This keeps the request CPU deterministic (compute happens via scheduled/admin refresh).
+  const stale = await readStaleHomepageSnapshotJson(c.env.DB, now);
+  if (stale) {
+    c.header('Content-Type', 'application/json; charset=utf-8');
+    const res = c.body(stale.bodyJson);
+    applyHomepageCacheHeaders(res, Math.min(60, stale.age));
     return res;
   }
 

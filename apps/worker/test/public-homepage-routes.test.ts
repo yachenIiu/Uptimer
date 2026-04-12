@@ -278,8 +278,15 @@ describe('public homepage route', () => {
     expect(res.headers.get('Vary')).toContain('Origin');
   });
 
-  it('partitions cached homepage responses by Origin when app-level CORS reflection is enabled', async () => {
+  it('partitions cached homepage artifact responses by Origin when app-level CORS reflection is enabled', async () => {
     const payload = samplePayload(190);
+    const render = {
+      generated_at: payload.generated_at,
+      preload_html: '<div id="uptimer-preload">hello</div>',
+      snapshot: payload,
+      meta_title: 'Uptimer',
+      meta_description: 'All Systems Operational',
+    };
     const dbReads: string[] = [];
     vi.spyOn(Date, 'now').mockReturnValue(200_000);
 
@@ -288,10 +295,10 @@ describe('public homepage route', () => {
         match: 'from public_snapshots',
         first: (args) => {
           dbReads.push(String(args[0]));
-          return args[0] === 'homepage'
+          return args[0] === 'homepage:artifact'
             ? {
                 generated_at: payload.generated_at,
-                body_json: JSON.stringify(payload),
+                body_json: JSON.stringify(render),
               }
             : null;
         },
@@ -299,17 +306,17 @@ describe('public homepage route', () => {
     ];
 
     const first = await requestHomepageViaApp(
-      '/api/v1/public/homepage',
+      '/api/v1/public/homepage-artifact',
       handlers,
       'https://one.example.com',
     );
     const second = await requestHomepageViaApp(
-      '/api/v1/public/homepage',
+      '/api/v1/public/homepage-artifact',
       handlers,
       'https://two.example.com',
     );
     const third = await requestHomepageViaApp(
-      '/api/v1/public/homepage',
+      '/api/v1/public/homepage-artifact',
       handlers,
       'https://one.example.com',
     );
@@ -317,7 +324,7 @@ describe('public homepage route', () => {
     expect(first.headers.get('Access-Control-Allow-Origin')).toBe('https://one.example.com');
     expect(second.headers.get('Access-Control-Allow-Origin')).toBe('https://two.example.com');
     expect(third.headers.get('Access-Control-Allow-Origin')).toBe('https://one.example.com');
-    expect(dbReads).toEqual(['homepage', 'homepage']);
+    expect(dbReads).toEqual(['homepage:artifact', 'homepage:artifact']);
   });
 
   it('serves a bounded stale homepage snapshot instead of computing in-request', async () => {
