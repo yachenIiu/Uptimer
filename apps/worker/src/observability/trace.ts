@@ -131,11 +131,11 @@ export class Trace {
     const pairs: string[] = [];
     for (const [key, value] of this.#labels.entries()) {
       const safeKey = key.replace(/[^a-zA-Z0-9_.-]/g, '_');
-      const safeValue = value.replace(/[;\\r\\n]/g, '_');
+      const safeValue = value.replace(/[;\r\n]/g, '_');
       pairs.push(`${safeKey}=${safeValue}`);
     }
     if (this.mode) {
-      pairs.push(`mode=${this.mode.replace(/[;\\r\\n]/g, '_')}`);
+      pairs.push(`mode=${this.mode.replace(/[;\r\n]/g, '_')}`);
     }
     return pairs.join(';');
   }
