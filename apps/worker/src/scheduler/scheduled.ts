@@ -35,6 +35,15 @@ const PERSIST_BATCH_SIZE = 25;
 // Look back a bit so maintenance start/end notifications are not missed if a tick is delayed.
 const MAINTENANCE_EVENT_LOOKBACK_SECONDS = 10 * 60;
 
+type CachedMonitorHttpJson = {
+  http_headers_json: string | null;
+  expected_status_json: string | null;
+  httpHeaders: Record<string, string> | null;
+  expectedStatus: number[] | null;
+};
+
+const cachedMonitorHttpJsonById = new Map<number, CachedMonitorHttpJson>();
+
 type DueMonitorRow = {
   id: number;
   name: string;
@@ -413,16 +422,31 @@ async function runDueMonitor(
           attempts: 1,
         };
       } else {
-        const httpHeaders = parseDbJsonNullable(httpHeadersJsonSchema, row.http_headers_json, {
-          field: 'http_headers_json',
-        });
-        const expectedStatus = parseDbJsonNullable(
-          expectedStatusJsonSchema,
-          row.expected_status_json,
-          {
-            field: 'expected_status_json',
-          },
-        );
+        const cached = cachedMonitorHttpJsonById.get(row.id);
+        const cachedMatches =
+          cached &&
+          cached.http_headers_json === row.http_headers_json &&
+          cached.expected_status_json === row.expected_status_json;
+
+        const httpHeaders = cachedMatches
+          ? cached.httpHeaders
+          : parseDbJsonNullable(httpHeadersJsonSchema, row.http_headers_json, {
+              field: 'http_headers_json',
+            });
+        const expectedStatus = cachedMatches
+          ? cached.expectedStatus
+          : parseDbJsonNullable(expectedStatusJsonSchema, row.expected_status_json, {
+              field: 'expected_status_json',
+            });
+
+        if (!cachedMatches) {
+          cachedMonitorHttpJsonById.set(row.id, {
+            http_headers_json: row.http_headers_json,
+            expected_status_json: row.expected_status_json,
+            httpHeaders,
+            expectedStatus,
+          });
+        }
 
         outcome = await runHttpCheck({
           url: row.target,
