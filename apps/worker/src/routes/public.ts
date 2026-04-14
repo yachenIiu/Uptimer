@@ -36,6 +36,7 @@ import {
 
 import { AppError } from '../middleware/errors';
 import { cachePublic } from '../middleware/cache-public';
+import { Trace, applyTraceToResponse, resolveTraceOptions } from '../observability/trace';
 
 type PublicStatusSnapshotRow = {
   generated_at: number;
@@ -548,23 +549,44 @@ async function listMaintenanceWindowMonitorIdsByWindowId(
 publicRoutes.get('/status', async (c) => {
   const now = Math.floor(Date.now() / 1000);
   const includeHiddenMonitors = isAuthorizedStatusAdminRequest(c);
+  const trace = new Trace(
+    resolveTraceOptions({
+      header: (name) => c.req.header(name),
+      env: c.env as unknown as Record<string, unknown>,
+    }),
+  );
+  trace.setLabel('route', 'public/status');
+  trace.setLabel('hidden', includeHiddenMonitors);
 
   if (includeHiddenMonitors) {
-    const payload = await computePublicStatusPayload(c.env.DB, now, {
+    const payload = await trace.timeAsync('status_compute', () =>
+      computePublicStatusPayload(c.env.DB, now, {
       includeHiddenMonitors: true,
-    });
-    return applyPrivateNoStore(c.json(payload));
+      }),
+    );
+    const res = applyPrivateNoStore(c.json(payload));
+    trace.finish('total');
+    applyTraceToResponse({ res, trace, prefix: 'w' });
+    return res;
   }
 
-  const snapshot = await readStatusSnapshotJson(c.env.DB, now);
+  const snapshot = await trace.timeAsync('status_snapshot_read', () =>
+    readStatusSnapshotJson(c.env.DB, now),
+  );
   if (snapshot) {
     c.header('Content-Type', 'application/json; charset=utf-8');
     const res = c.body(snapshot.bodyJson);
     applyStatusCacheHeaders(res, snapshot.age);
+    trace.setLabel('path', 'snapshot');
+    trace.setLabel('age', snapshot.age);
+    trace.finish('total');
+    applyTraceToResponse({ res, trace, prefix: 'w' });
     return res;
   }
   try {
-    const payload = await computePublicStatusPayload(c.env.DB, now);
+    const payload = await trace.timeAsync('status_compute', () =>
+      computePublicStatusPayload(c.env.DB, now),
+    );
     const res = c.json(payload);
     applyStatusCacheHeaders(res, 0);
 
@@ -574,6 +596,9 @@ publicRoutes.get('/status', async (c) => {
       }),
     );
 
+    trace.setLabel('path', 'compute');
+    trace.finish('total');
+    applyTraceToResponse({ res, trace, prefix: 'w' });
     return res;
   } catch (err) {
     console.warn('public status: compute failed', err);
@@ -584,6 +609,10 @@ publicRoutes.get('/status', async (c) => {
     if (stale) {
       const res = c.json(toSnapshotPayload(stale.data));
       applyStatusCacheHeaders(res, Math.min(60, stale.age));
+      trace.setLabel('path', 'stale');
+      trace.setLabel('age', stale.age);
+      trace.finish('total');
+      applyTraceToResponse({ res, trace, prefix: 'w' });
       return res;
     }
 
@@ -593,11 +622,24 @@ publicRoutes.get('/status', async (c) => {
 
 publicRoutes.get('/homepage', async (c) => {
   const now = Math.floor(Date.now() / 1000);
-  const snapshot = await readHomepageSnapshotJson(c.env.DB, now);
+  const trace = new Trace(
+    resolveTraceOptions({
+      header: (name) => c.req.header(name),
+      env: c.env as unknown as Record<string, unknown>,
+    }),
+  );
+  trace.setLabel('route', 'public/homepage');
+  const snapshot = await trace.timeAsync('homepage_snapshot_read', () =>
+    readHomepageSnapshotJson(c.env.DB, now),
+  );
   if (snapshot) {
     c.header('Content-Type', 'application/json; charset=utf-8');
     const res = c.body(snapshot.bodyJson);
     applyHomepageCacheHeaders(res, snapshot.age);
+    trace.setLabel('path', 'snapshot');
+    trace.setLabel('age', snapshot.age);
+    trace.finish('total');
+    applyTraceToResponse({ res, trace, prefix: 'w' });
     return res;
   }
 
@@ -608,32 +650,51 @@ publicRoutes.get('/homepage', async (c) => {
       maintenanceHistoryPreview: null,
     };
   });
-  const statusSnapshot = await readStatusSnapshot(c.env.DB, now);
+  const statusSnapshot = await trace.timeAsync('status_snapshot_read', () =>
+    readStatusSnapshot(c.env.DB, now),
+  );
   if (statusSnapshot) {
-    const payload = homepageFromStatusPayload(
-      statusSnapshot.data,
-      await historyPreviewsPromise,
+    const previews = await trace.timeAsync('homepage_previews', () => historyPreviewsPromise);
+    const payload = trace.time('homepage_compose', () =>
+      homepageFromStatusPayload(statusSnapshot.data, previews),
     );
     const res = c.json(payload);
     applyHomepageCacheHeaders(res, statusSnapshot.age);
+    trace.setLabel('path', 'status_snapshot');
+    trace.setLabel('age', statusSnapshot.age);
+    trace.finish('total');
+    applyTraceToResponse({ res, trace, prefix: 'w' });
     return res;
   }
 
-  const artifactSnapshotPromise = readStaleHomepageSnapshotArtifact(c.env.DB, now);
+  const artifactSnapshotPromise = trace.timeAsync('homepage_artifact_stale_read', () =>
+    readStaleHomepageSnapshotArtifact(c.env.DB, now),
+  );
 
   try {
-    const statusPayload = await computePublicStatusPayload(c.env.DB, now);
-    const artifactSnapshot = await artifactSnapshotPromise;
+    const statusPayload = await trace.timeAsync('status_compute', () =>
+      computePublicStatusPayload(c.env.DB, now),
+    );
+    const artifactSnapshot = await trace.timeAsync('homepage_artifact_stale_wait', () =>
+      artifactSnapshotPromise,
+    );
     if (
       artifactSnapshot &&
       shouldPreferRecentHomepageArtifact({ artifact: artifactSnapshot, computed: statusPayload })
     ) {
       const res = c.json(artifactSnapshot.data.snapshot);
       applyHomepageCacheHeaders(res, Math.min(60, artifactSnapshot.age));
+      trace.setLabel('path', 'artifact_prefer');
+      trace.setLabel('age', artifactSnapshot.age);
+      trace.finish('total');
+      applyTraceToResponse({ res, trace, prefix: 'w' });
       return res;
     }
 
-    const payload = homepageFromStatusPayload(statusPayload, await historyPreviewsPromise);
+    const previews = await trace.timeAsync('homepage_previews', () => historyPreviewsPromise);
+    const payload = trace.time('homepage_compose', () =>
+      homepageFromStatusPayload(statusPayload, previews),
+    );
     const res = c.json(payload);
     applyHomepageCacheHeaders(res, 0);
 
@@ -643,18 +704,29 @@ publicRoutes.get('/homepage', async (c) => {
       }),
     );
 
+    trace.setLabel('path', 'compute');
+    trace.finish('total');
+    applyTraceToResponse({ res, trace, prefix: 'w' });
     return res;
   } catch (err) {
     console.warn('public homepage: secondary status compute failed', err);
 
-    const staleHomepage = await readStaleHomepageSnapshot(c.env.DB, now);
+    const staleHomepage = await trace.timeAsync('homepage_snapshot_stale_read', () =>
+      readStaleHomepageSnapshot(c.env.DB, now),
+    );
     if (staleHomepage) {
       const res = c.json(staleHomepage.data);
       applyHomepageCacheHeaders(res, Math.min(60, staleHomepage.age));
+      trace.setLabel('path', 'stale_homepage');
+      trace.setLabel('age', staleHomepage.age);
+      trace.finish('total');
+      applyTraceToResponse({ res, trace, prefix: 'w' });
       return res;
     }
 
-    const staleStatus = await readStaleStatusSnapshot(c.env.DB, now, 10 * 60);
+    const staleStatus = await trace.timeAsync('status_snapshot_stale_read', () =>
+      readStaleStatusSnapshot(c.env.DB, now, 10 * 60),
+    );
     if (staleStatus) {
       const payload = homepageFromStatusPayload(
         toSnapshotPayload(staleStatus.data),
@@ -665,13 +737,23 @@ publicRoutes.get('/homepage', async (c) => {
       );
       const res = c.json(payload);
       applyHomepageCacheHeaders(res, Math.min(60, staleStatus.age));
+      trace.setLabel('path', 'stale_status');
+      trace.setLabel('age', staleStatus.age);
+      trace.finish('total');
+      applyTraceToResponse({ res, trace, prefix: 'w' });
       return res;
     }
 
-    const staleArtifact = await artifactSnapshotPromise;
+    const staleArtifact = await trace.timeAsync('homepage_artifact_stale_wait', () =>
+      artifactSnapshotPromise,
+    );
     if (staleArtifact) {
       const res = c.json(staleArtifact.data.snapshot);
       applyHomepageCacheHeaders(res, Math.min(60, staleArtifact.age));
+      trace.setLabel('path', 'stale_artifact');
+      trace.setLabel('age', staleArtifact.age);
+      trace.finish('total');
+      applyTraceToResponse({ res, trace, prefix: 'w' });
       return res;
     }
 
@@ -681,19 +763,40 @@ publicRoutes.get('/homepage', async (c) => {
 
 publicRoutes.get('/homepage-artifact', async (c) => {
   const now = Math.floor(Date.now() / 1000);
-  const snapshot = await readHomepageSnapshotArtifactJson(c.env.DB, now);
+  const trace = new Trace(
+    resolveTraceOptions({
+      header: (name) => c.req.header(name),
+      env: c.env as unknown as Record<string, unknown>,
+    }),
+  );
+  trace.setLabel('route', 'public/homepage-artifact');
+  const snapshot = await trace.timeAsync('homepage_artifact_read', () =>
+    readHomepageSnapshotArtifactJson(c.env.DB, now),
+  );
   if (snapshot) {
     c.header('Content-Type', 'application/json; charset=utf-8');
     const res = c.body(snapshot.bodyJson);
     applyHomepageCacheHeaders(res, snapshot.age);
+    trace.setLabel('path', 'snapshot');
+    trace.setLabel('age', snapshot.age);
+    trace.setLabel('bytes', snapshot.bodyJson.length);
+    trace.finish('total');
+    applyTraceToResponse({ res, trace, prefix: 'w' });
     return res;
   }
 
-  const stale = await readStaleHomepageSnapshotArtifactJson(c.env.DB, now);
+  const stale = await trace.timeAsync('homepage_artifact_stale_read', () =>
+    readStaleHomepageSnapshotArtifactJson(c.env.DB, now),
+  );
   if (stale) {
     c.header('Content-Type', 'application/json; charset=utf-8');
     const res = c.body(stale.bodyJson);
     applyHomepageCacheHeaders(res, Math.min(60, stale.age));
+    trace.setLabel('path', 'stale');
+    trace.setLabel('age', stale.age);
+    trace.setLabel('bytes', stale.bodyJson.length);
+    trace.finish('total');
+    applyTraceToResponse({ res, trace, prefix: 'w' });
     return res;
   }
 

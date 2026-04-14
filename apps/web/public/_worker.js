@@ -2,10 +2,180 @@ const SNAPSHOT_MAX_AGE_SECONDS = 60;
 const PREFERRED_MAX_AGE_SECONDS = 30;
 const FALLBACK_HTML_MAX_AGE_SECONDS = 600;
 const HOMEPAGE_CACHE_GENERATED_AT_HEADER = 'X-Uptimer-Generated-At';
+const TRACE_HEADER = 'X-Uptimer-Trace';
+const TRACE_ID_HEADER = 'X-Uptimer-Trace-Id';
+const TRACE_TOKEN_HEADER = 'X-Uptimer-Trace-Token';
+const TRACE_MODE_HEADER = 'X-Uptimer-Trace-Mode';
 
 function acceptsHtml(request) {
   const accept = request.headers.get('Accept') || '';
   return accept.includes('text/html');
+}
+
+function normalizeTruthyHeader(value) {
+  if (!value) return false;
+  const normalized = String(value).trim().toLowerCase();
+  if (!normalized) return false;
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
+}
+
+function resolveTraceContext(request, env) {
+  const enabled = normalizeTruthyHeader(request.headers.get(TRACE_HEADER));
+  if (!enabled) return null;
+
+  const tokenEnv = typeof env?.UPTIMER_TRACE_TOKEN === 'string' ? env.UPTIMER_TRACE_TOKEN.trim() : '';
+  const fallbackEnvToken = typeof env?.TRACE_TOKEN === 'string' ? env.TRACE_TOKEN.trim() : '';
+  const expectedToken = tokenEnv || fallbackEnvToken;
+  const providedToken = request.headers.get(TRACE_TOKEN_HEADER) || '';
+  if (expectedToken && providedToken !== expectedToken) return null;
+
+  const id = request.headers.get(TRACE_ID_HEADER) || crypto.randomUUID();
+  const modeRaw = request.headers.get(TRACE_MODE_HEADER) || '';
+  const mode = modeRaw.trim().length > 0 ? modeRaw.trim() : null;
+
+  const spans = [];
+  const labels = new Map();
+  const t0 = performance.now();
+  let finished = false;
+
+  function setLabel(key, value) {
+    if (!key) return;
+    if (value === null || value === undefined) return;
+    const str = typeof value === 'string' ? value : String(value);
+    if (!str) return;
+    labels.set(String(key), str.replace(/[;\r\n]/g, '_'));
+  }
+
+  function addSpan(name, durMs) {
+    if (!name) return;
+    spans.push({ name: String(name), durMs: Number.isFinite(durMs) ? Math.max(0, durMs) : 0 });
+  }
+
+  function time(name, fn) {
+    const tStart = performance.now();
+    const out = fn();
+    const tEnd = performance.now();
+    addSpan(name, tEnd - tStart);
+    return out;
+  }
+
+  async function timeAsync(name, fn) {
+    const tStart = performance.now();
+    try {
+      return await fn();
+    } finally {
+      const tEnd = performance.now();
+      addSpan(name, tEnd - tStart);
+    }
+  }
+
+  function finish(name = 'total') {
+    if (finished) return;
+    finished = true;
+    addSpan(name, performance.now() - t0);
+  }
+
+  function toServerTiming(prefix = 'p') {
+    const p = prefix && String(prefix).trim().length > 0 ? `${String(prefix).trim()}_` : '';
+    return spans
+      .map((span) => `${(p + span.name).replace(/[^a-zA-Z0-9_.-]/g, '_')};dur=${span.durMs.toFixed(2)}`)
+      .join(', ');
+  }
+
+  function toInfoHeader(prefix = 'p') {
+    const p = prefix && String(prefix).trim().length > 0 ? `${String(prefix).trim()}_` : '';
+    const parts = [];
+    for (const [key, value] of labels.entries()) {
+      parts.push(`${(p + key).replace(/[^a-zA-Z0-9_.-]/g, '_')}=${value}`);
+    }
+    if (mode) {
+      parts.push(`${p}mode=${mode.replace(/[;\r\n]/g, '_')}`);
+    }
+    return parts.join(';');
+  }
+
+  return {
+    id,
+    mode,
+    token: providedToken,
+    spans,
+    labels,
+    apiServerTiming: null,
+    apiInfo: null,
+    setLabel,
+    addSpan,
+    time,
+    timeAsync,
+    finish,
+    toServerTiming,
+    toInfoHeader,
+  };
+}
+
+function appendServerTiming(headers, value) {
+  if (!value) return;
+  const existing = headers.get('Server-Timing');
+  if (existing) {
+    headers.set('Server-Timing', `${existing}, ${value}`);
+  } else {
+    headers.set('Server-Timing', value);
+  }
+}
+
+function prefixServerTiming(value, prefix) {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw) return '';
+  const p = prefix && String(prefix).trim().length > 0 ? `${String(prefix).trim()}_` : '';
+  return raw
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const idx = part.indexOf(';');
+      if (idx <= 0) return `${p}${part}`;
+      const name = part.slice(0, idx).trim();
+      return `${p}${name}${part.slice(idx)}`;
+    })
+    .join(', ');
+}
+
+function mergeTraceInfo(targetLabels, rawInfo, prefix) {
+  const raw = typeof rawInfo === 'string' ? rawInfo.trim() : '';
+  if (!raw) return;
+  const p = prefix && String(prefix).trim().length > 0 ? `${String(prefix).trim()}_` : '';
+  for (const part of raw.split(';')) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq <= 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const value = trimmed.slice(eq + 1).trim();
+    if (!key || !value) continue;
+    targetLabels.set(`${p}${key}`.replace(/[^a-zA-Z0-9_.-]/g, '_'), value.replace(/[;\r\n]/g, '_'));
+  }
+}
+
+function finalizeTraceResponse(res, trace) {
+  if (!trace) return res;
+
+  // Fold API trace info into page labels before rendering headers.
+  mergeTraceInfo(trace.labels, trace.apiInfo, 'api');
+
+  trace.finish('total');
+
+  const out = new Response(res.body, res);
+  out.headers.set(TRACE_ID_HEADER, trace.id);
+
+  const info = trace.toInfoHeader('p');
+  if (info) {
+    const existing = out.headers.get(TRACE_HEADER);
+    out.headers.set(TRACE_HEADER, existing ? `${existing};${info}` : info);
+  }
+
+  appendServerTiming(out.headers, trace.toServerTiming('p'));
+  appendServerTiming(out.headers, prefixServerTiming(trace.apiServerTiming, 'api'));
+
+  return out;
 }
 
 function escapeHtml(value) {
@@ -200,7 +370,7 @@ async function fetchIndexHtml(env, url) {
   return env.ASSETS.fetch(req);
 }
 
-async function fetchPublicHomepageArtifact(env) {
+async function fetchPublicHomepageArtifact(env, trace) {
   const apiOrigin = env.UPTIMER_API_ORIGIN;
   if (typeof apiOrigin !== 'string' || apiOrigin.length === 0) return null;
 
@@ -211,14 +381,33 @@ async function fetchPublicHomepageArtifact(env) {
   const t = setTimeout(() => controller.abort(), 800);
 
   try {
-    const resp = await fetch(statusUrl.toString(), {
-      headers: { Accept: 'application/json' },
-      signal: controller.signal,
-    });
+    const headers = { Accept: 'application/json' };
+    if (trace) {
+      headers[TRACE_HEADER] = '1';
+      headers[TRACE_ID_HEADER] = trace.id;
+      if (trace.token) headers[TRACE_TOKEN_HEADER] = trace.token;
+      if (trace.mode) headers[TRACE_MODE_HEADER] = trace.mode;
+    }
+
+    const resp = trace
+      ? await trace.timeAsync('api_fetch', () =>
+          fetch(statusUrl.toString(), { headers, signal: controller.signal }),
+        )
+      : await fetch(statusUrl.toString(), { headers, signal: controller.signal });
+
+    if (trace) {
+      trace.setLabel('api_status', resp.status);
+      const serverTiming = resp.headers.get('Server-Timing');
+      if (serverTiming) trace.apiServerTiming = serverTiming;
+      const apiInfo = resp.headers.get(TRACE_HEADER);
+      if (apiInfo) trace.apiInfo = apiInfo;
+    }
 
     if (!resp.ok) return null;
 
-    const data = await resp.json();
+    const data = trace
+      ? await trace.timeAsync('api_json', () => resp.json())
+      : await resp.json();
     if (!data || typeof data !== 'object') return null;
 
     if (typeof data.preload_html !== 'string') return null;
@@ -242,6 +431,7 @@ export default {
       }
 
       const url = new URL(request.url);
+      const trace = resolveTraceContext(request, env);
 
       // HTML requests: serve SPA entry for client-side routes.
       const wantsHtml = request.method === 'GET' && acceptsHtml(request);
@@ -249,61 +439,121 @@ export default {
       // Special-case the status page for HTML injection.
       const isStatusPage = url.pathname === '/' || url.pathname === '/index.html';
       if (wantsHtml && isStatusPage) {
+        if (trace) {
+          trace.setLabel('route', 'pages/homepage');
+        }
+
         const cacheKey = new Request(url.origin + '/', { method: 'GET' });
         let cached = null;
-        try {
-          cached = await caches.default.match(cacheKey);
-        } catch {
+        if (trace && trace.mode === 'bypass-cache') {
+          trace.setLabel('cache', 'bypass');
           cached = null;
+        } else {
+          try {
+            cached = trace
+              ? await trace.timeAsync('cache_match', () => caches.default.match(cacheKey))
+              : await caches.default.match(cacheKey);
+          } catch {
+            cached = null;
+          }
         }
 
         const now = Math.floor(Date.now() / 1000);
         if (cached) {
           const cachedGeneratedAt = readGeneratedAtHeader(cached);
           if (cachedGeneratedAt === null) {
-            return cached;
+            if (trace) {
+              trace.setLabel('path', 'cache_hit_raw');
+            }
+            return finalizeTraceResponse(cached, trace);
           }
 
-        const cachedAge = Math.max(0, now - cachedGeneratedAt);
-        if (cachedAge <= SNAPSHOT_MAX_AGE_SECONDS) {
-          return buildHomepageCacheHit(cached, cachedAge);
-        }
-      }
-
-      const base = await fetchIndexHtml(env, url);
-      const html = await base.text();
-
-      const artifact = await fetchPublicHomepageArtifact(env);
-      if (!artifact) {
-        if (cached) {
-          const cachedGeneratedAt = readGeneratedAtHeader(cached);
-          if (cachedGeneratedAt === null) return cached;
-          return buildHomepageCacheHit(cached, Math.max(0, now - cachedGeneratedAt));
+          const cachedAge = Math.max(0, now - cachedGeneratedAt);
+          if (cachedAge <= SNAPSHOT_MAX_AGE_SECONDS) {
+            const hit = trace
+              ? trace.time('cache_hit_build', () => buildHomepageCacheHit(cached, cachedAge))
+              : buildHomepageCacheHit(cached, cachedAge);
+            if (trace) {
+              trace.setLabel('path', 'cache_hit');
+              trace.setLabel('age', cachedAge);
+            }
+            return finalizeTraceResponse(hit, trace);
+          }
         }
 
-        const headers = new Headers(base.headers);
-        headers.set('Content-Type', 'text/html; charset=utf-8');
-        headers.append('Vary', 'Accept');
-        headers.delete('Location');
+        const base = trace
+          ? await trace.timeAsync('index_fetch', () => fetchIndexHtml(env, url))
+          : await fetchIndexHtml(env, url);
+        const html = trace
+          ? await trace.timeAsync('index_text', () => base.text())
+          : await base.text();
 
-          return new Response(html, { status: 200, headers });
+        const artifact = await fetchPublicHomepageArtifact(env, trace);
+        if (!artifact) {
+          if (cached) {
+            const cachedGeneratedAt = readGeneratedAtHeader(cached);
+            if (cachedGeneratedAt === null) {
+              if (trace) trace.setLabel('path', 'api_fail_cache_raw');
+              return finalizeTraceResponse(cached, trace);
+            }
+            const cachedAge = Math.max(0, now - cachedGeneratedAt);
+            const hit = trace
+              ? trace.time('cache_hit_build', () => buildHomepageCacheHit(cached, cachedAge))
+              : buildHomepageCacheHit(cached, cachedAge);
+            if (trace) {
+              trace.setLabel('path', 'api_fail_cache_hit');
+              trace.setLabel('age', cachedAge);
+            }
+            return finalizeTraceResponse(hit, trace);
+          }
+
+          const headers = new Headers(base.headers);
+          headers.set('Content-Type', 'text/html; charset=utf-8');
+          headers.append('Vary', 'Accept');
+          headers.delete('Location');
+
+          if (trace) {
+            trace.setLabel('path', 'api_fail_index');
+            trace.setLabel('html_chars', html.length);
+          }
+          return finalizeTraceResponse(new Response(html, { status: 200, headers }), trace);
         }
 
         const generatedAt =
           typeof artifact.generated_at === 'number' ? artifact.generated_at : now;
         const age = Math.max(0, now - generatedAt);
 
-        let injected = html.replace(
-          '<div id="root"></div>',
-          `${artifact.preload_html}<div id="root"></div>`,
-        );
+        const snapshotInlineJson = trace
+          ? trace.time('snapshot_inline_json', () => safeJsonForInlineScript(artifact.snapshot))
+          : safeJsonForInlineScript(artifact.snapshot);
 
-        injected = injectStatusMetaTags(injected, artifact, url);
+        let injected = trace
+          ? trace.time('inject_root', () =>
+              html.replace(
+                '<div id="root"></div>',
+                `${artifact.preload_html}<div id="root"></div>`,
+              ),
+            )
+          : html.replace(
+              '<div id="root"></div>',
+              `${artifact.preload_html}<div id="root"></div>`,
+            );
 
-        injected = injected.replace(
-          '</head>',
-          `  ${HOMEPAGE_PRELOAD_STYLE_TAG}\n  <script>globalThis.__UPTIMER_INITIAL_HOMEPAGE__=${safeJsonForInlineScript(artifact.snapshot)};</script>\n</head>`,
-        );
+        injected = trace
+          ? trace.time('inject_meta', () => injectStatusMetaTags(injected, artifact, url))
+          : injectStatusMetaTags(injected, artifact, url);
+
+        injected = trace
+          ? trace.time('inject_bootstrap', () =>
+              injected.replace(
+                '</head>',
+                `  ${HOMEPAGE_PRELOAD_STYLE_TAG}\n  <script>globalThis.__UPTIMER_INITIAL_HOMEPAGE__=${snapshotInlineJson};</script>\n</head>`,
+              ),
+            )
+          : injected.replace(
+              '</head>',
+              `  ${HOMEPAGE_PRELOAD_STYLE_TAG}\n  <script>globalThis.__UPTIMER_INITIAL_HOMEPAGE__=${snapshotInlineJson};</script>\n</head>`,
+            );
 
         const headers = new Headers(base.headers);
         headers.set('Content-Type', 'text/html; charset=utf-8');
@@ -311,21 +561,37 @@ export default {
         headers.append('Vary', 'Accept');
         headers.delete('Location');
 
-        const resp = new Response(injected, { status: 200, headers });
+        const resp = trace
+          ? trace.time('resp_build', () => new Response(injected, { status: 200, headers }))
+          : new Response(injected, { status: 200, headers });
 
         const cacheHeaders = new Headers(headers);
         cacheHeaders.set('Cache-Control', `public, max-age=${FALLBACK_HTML_MAX_AGE_SECONDS}`);
         cacheHeaders.set(HOMEPAGE_CACHE_GENERATED_AT_HEADER, `${generatedAt}`);
         cacheHeaders.delete('Set-Cookie');
-        const cacheResp = new Response(injected, { status: 200, headers: cacheHeaders });
+        const cacheResp = trace
+          ? trace.time('cache_resp_build', () =>
+              new Response(injected, { status: 200, headers: cacheHeaders }),
+            )
+          : new Response(injected, { status: 200, headers: cacheHeaders });
 
         try {
-          ctx.waitUntil(caches.default.put(cacheKey, cacheResp).catch(() => undefined));
+          if (!trace || trace.mode !== 'bypass-cache') {
+            ctx.waitUntil(caches.default.put(cacheKey, cacheResp).catch(() => undefined));
+          } else if (trace) {
+            trace.setLabel('cache_put', 'skip');
+          }
         } catch {
           // Ignore cache write failures. The injected HTML response is still usable and
           // the worker should never throw a 1101 just because the cache rejected a put.
         }
-        return resp;
+        if (trace) {
+          trace.setLabel('path', 'inject');
+          trace.setLabel('age', age);
+          trace.setLabel('html_chars', injected.length);
+          trace.setLabel('payload_chars', snapshotInlineJson.length);
+        }
+        return finalizeTraceResponse(resp, trace);
       }
 
       // Default: serve static assets.
