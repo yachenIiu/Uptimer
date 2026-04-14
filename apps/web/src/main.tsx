@@ -16,7 +16,7 @@ declare global {
   var __UPTIMER_INITIAL_STATUS__: StatusResponse | undefined;
 }
 
-const LS_PUBLIC_HOMEPAGE_KEY = 'uptimer_public_homepage_snapshot_v1';
+const LS_PUBLIC_HOMEPAGE_KEY = 'uptimer_public_homepage_snapshot_v2';
 const LS_PUBLIC_STATUS_KEY = 'uptimer_public_status_snapshot_v1';
 
 type PersistedHomepageCache = {
@@ -48,8 +48,6 @@ function readPersistedHomepageCache(): PublicHomepageResponse | null {
     const value = (parsed as { value?: unknown }).value;
     if (!value || typeof value !== 'object') return null;
     if (typeof (value as { generated_at?: unknown }).generated_at !== 'number') return null;
-    if ((value as { bootstrap_mode?: unknown }).bootstrap_mode === 'partial') return null;
-
     return value as PublicHomepageResponse;
   } catch {
     return null;
@@ -76,8 +74,6 @@ function readPersistedStatusCache(): StatusResponse | null {
 }
 
 function writePersistedHomepageCache(value: PublicHomepageResponse): void {
-  if (value.bootstrap_mode === 'partial') return;
-
   try {
     const payload: PersistedHomepageCache = { at: Date.now(), value };
     localStorage.setItem(LS_PUBLIC_HOMEPAGE_KEY, JSON.stringify(payload));
@@ -170,11 +166,7 @@ const seedHomepage = initialHomepage ?? persistedHomepage;
 
 if (seedHomepage) {
   const updatedAt =
-    seedHomepage.bootstrap_mode === 'partial'
-      ? 0
-      : typeof seedHomepage.generated_at === 'number'
-        ? seedHomepage.generated_at * 1000
-        : Date.now();
+    typeof seedHomepage.generated_at === 'number' ? seedHomepage.generated_at * 1000 : Date.now();
 
   queryClient.setQueryData<PublicHomepageResponse>(['homepage'], seedHomepage, { updatedAt });
   writePersistedHomepageCache(seedHomepage);

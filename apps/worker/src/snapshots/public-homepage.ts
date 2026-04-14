@@ -10,7 +10,6 @@ const SNAPSHOT_ARTIFACT_KEY = 'homepage:artifact';
 const MAX_AGE_SECONDS = 60;
 const MAX_STALE_SECONDS = 10 * 60;
 const REFRESH_LOCK_NAME = 'snapshot:homepage:refresh';
-const MAX_BOOTSTRAP_MONITORS = 12;
 const READ_SNAPSHOT_SQL = `
   SELECT generated_at, body_json
   FROM public_snapshots
@@ -258,7 +257,6 @@ function renderPreload(
 
   const activeMaintenance = snapshot.maintenance_windows.active;
   const upcomingMaintenance = snapshot.maintenance_windows.upcoming;
-  const hiddenMonitorCount = Math.max(0, snapshot.monitor_count_total - snapshot.monitors.length);
   let maintenanceSection = '';
   if (activeMaintenance.length > 0 || upcomingMaintenance.length > 0) {
     const activeCards: string[] = [];
@@ -297,48 +295,37 @@ function renderPreload(
   const descriptionHtml = siteDescription
     ? `<div class="ud">${escapeHtml(siteDescription)}</div>`
     : '';
-  const hiddenMonitorMessage =
-    hiddenMonitorCount > 0
-      ? `<div class="card ft">${hiddenMonitorCount} more services will appear after the app finishes loading.</div>`
-      : '';
-
-  return `<div class="hp"><header class="uh"><div class="uw uhw"><div class="ut"><div class="un">${escapeHtml(siteTitle)}</div>${descriptionHtml}</div><span class="sb sb-${overall}">${escapeHtml(overall)}</span></div></header><main class="uw um"><section class="bn"><div class="bt">${escapeHtml(bannerTitle)}</div><div class="bu">Updated: ${formatTimestamp(generatedAt)}</div></section>${maintenanceSection}${incidentSection}<section class="sec"><h3 class="sh">Services</h3>${groupedMonitorsParts.join('')}${hiddenMonitorMessage}</section><section class="sec ih"><div><h3 class="sh">Incident History</h3>${incidentHistory}</div><div><h3 class="sh">Maintenance History</h3>${maintenanceHistory}</div></section></main></div>`;
+  return `<div class="hp"><header class="uh"><div class="uw uhw"><div class="ut"><div class="un">${escapeHtml(siteTitle)}</div>${descriptionHtml}</div><span class="sb sb-${overall}">${escapeHtml(overall)}</span></div></header><main class="uw um"><section class="bn"><div class="bt">${escapeHtml(bannerTitle)}</div><div class="bu">Updated: ${formatTimestamp(generatedAt)}</div></section>${maintenanceSection}${incidentSection}<section class="sec"><h3 class="sh">Services</h3>${groupedMonitorsParts.join('')}</section><section class="sec ih"><div><h3 class="sh">Incident History</h3>${incidentHistory}</div><div><h3 class="sh">Maintenance History</h3>${maintenanceHistory}</div></section></main></div>`;
 }
 
 export function buildHomepageRenderArtifact(
   snapshot: PublicHomepageResponse,
 ): PublicHomepageRenderArtifact {
+  const fullSnapshot: PublicHomepageResponse = {
+    ...snapshot,
+    bootstrap_mode: 'full',
+    monitor_count_total: snapshot.monitors.length,
+  };
   const needsMonitorNames =
-    snapshot.maintenance_windows.active.length > 0 ||
-    snapshot.maintenance_windows.upcoming.length > 0 ||
-    snapshot.maintenance_history_preview !== null;
+    fullSnapshot.maintenance_windows.active.length > 0 ||
+    fullSnapshot.maintenance_windows.upcoming.length > 0 ||
+    fullSnapshot.maintenance_history_preview !== null;
   const allMonitorNames = needsMonitorNames
-    ? new Map(snapshot.monitors.map((monitor) => [monitor.id, monitor.name]))
+    ? new Map(fullSnapshot.monitors.map((monitor) => [monitor.id, monitor.name]))
     : undefined;
-  const bootstrapSnapshot =
-    snapshot.bootstrap_mode === 'partial' || snapshot.monitors.length > MAX_BOOTSTRAP_MONITORS
-      ? {
-          ...snapshot,
-          bootstrap_mode: 'partial' as const,
-          monitors: snapshot.monitors.slice(0, MAX_BOOTSTRAP_MONITORS),
-        }
-      : {
-          ...snapshot,
-          bootstrap_mode: 'full' as const,
-        };
-  const metaTitle = normalizeSnapshotText(snapshot.site_title, 'Uptimer');
+  const metaTitle = normalizeSnapshotText(fullSnapshot.site_title, 'Uptimer');
   const fallbackDescription = normalizeSnapshotText(
-    snapshot.banner.title,
+    fullSnapshot.banner.title,
     'Real-time status and incident updates.',
   );
-  const metaDescription = normalizeSnapshotText(snapshot.site_description, fallbackDescription)
+  const metaDescription = normalizeSnapshotText(fullSnapshot.site_description, fallbackDescription)
     .replace(/\s+/g, ' ')
     .trim();
 
   return {
-    generated_at: snapshot.generated_at,
-    preload_html: `<div id="uptimer-preload">${renderPreload(bootstrapSnapshot, allMonitorNames)}</div>`,
-    snapshot: bootstrapSnapshot,
+    generated_at: fullSnapshot.generated_at,
+    preload_html: `<div id="uptimer-preload">${renderPreload(fullSnapshot, allMonitorNames)}</div>`,
+    snapshot: fullSnapshot,
     meta_title: metaTitle,
     meta_description: metaDescription,
   };

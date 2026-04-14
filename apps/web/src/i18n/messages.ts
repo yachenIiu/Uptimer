@@ -104,10 +104,6 @@ const en = {
   'status_page.failed_load_incident_history': 'Failed to load incident history',
   'status_page.failed_load_maintenance_history': 'Failed to load maintenance history',
   'status_page.failed_load_data': 'Failed to load data',
-  'status_page.partial_bootstrap_loading':
-    '{count} more services are loading. The full list will appear when the refresh completes.',
-  'status_page.partial_bootstrap_error':
-    'Showing a partial service list because the latest refresh did not complete yet.',
   'status_page.incident_prefix': 'Incident: {value}',
   'status_page.maintenance_prefix': 'Maintenance: {value}',
   'status_page.initial_report': 'Initial Report',

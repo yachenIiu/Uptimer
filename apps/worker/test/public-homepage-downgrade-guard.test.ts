@@ -33,7 +33,7 @@ function installCacheMock() {
 function sampleArtifactSnapshot(now = 190) {
   return {
     generated_at: now,
-    bootstrap_mode: 'partial' as const,
+    bootstrap_mode: 'full' as const,
     monitor_count_total: 40,
     site_title: 'Status Hub',
     site_description: 'Production services',
@@ -182,7 +182,7 @@ describe('public homepage downgrade guard', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({
       generated_at: 190,
-      bootstrap_mode: 'partial',
+      bootstrap_mode: 'full',
       overall_status: 'up',
       banner: {
         status: 'operational',

@@ -155,7 +155,7 @@ describe('snapshots/public-homepage', () => {
     await expect(readHomepageSnapshotArtifact(db, 200)).resolves.toBeNull();
   });
 
-  it('caps bootstrap monitors in render artifacts to keep root misses bounded', () => {
+  it('keeps the full monitor list in render artifacts', () => {
     const payload = {
       ...samplePayload(190),
       monitor_count_total: 30,
@@ -183,11 +183,12 @@ describe('snapshots/public-homepage', () => {
 
     const artifact = buildHomepageRenderArtifact(payload);
     const bootstrapped = artifact.snapshot;
-    expect(bootstrapped.bootstrap_mode).toBe('partial');
+    expect(bootstrapped.bootstrap_mode).toBe('full');
     expect(bootstrapped.monitor_count_total).toBe(30);
-    expect(bootstrapped.monitors).toHaveLength(12);
+    expect(bootstrapped.monitors).toHaveLength(30);
     expect(artifact.preload_html).toContain('Monitor 30');
     expect(artifact.preload_html).not.toContain('#30');
+    expect(artifact.preload_html).not.toContain('more services will appear after the app finishes loading');
   });
 
   it('returns null when homepage snapshot is too old or invalid', async () => {
@@ -256,9 +257,9 @@ describe('snapshots/public-homepage', () => {
 
     const payload = {
       ...samplePayload(280),
-      bootstrap_mode: 'partial' as const,
+      bootstrap_mode: 'full' as const,
       monitor_count_total: 30,
-      monitors: Array.from({ length: 12 }, (_, index) => ({
+      monitors: Array.from({ length: 30 }, (_, index) => ({
         ...samplePayload(280).monitors[0],
         id: index + 1,
         name: `Monitor ${index + 1}`,
@@ -369,9 +370,9 @@ describe('snapshots/public-homepage', () => {
     const now = 1_728_000_120;
     const payload = {
       ...samplePayload(now),
-      bootstrap_mode: 'partial' as const,
+      bootstrap_mode: 'full' as const,
       monitor_count_total: 30,
-      monitors: Array.from({ length: 12 }, (_, index) => ({
+      monitors: Array.from({ length: 30 }, (_, index) => ({
         ...samplePayload(now).monitors[0],
         id: index + 1,
         name: `Monitor ${index + 1}`,

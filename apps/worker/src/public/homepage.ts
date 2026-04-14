@@ -988,7 +988,7 @@ export async function computePublicHomepageArtifactPayload(
 ): Promise<PublicHomepageResponse> {
   const includeHiddenMonitors = false;
   const settingsPromise = readPublicSiteSettings(db);
-  const bootstrapRowsPromise = listHomepageMonitorRows(db, includeHiddenMonitors, 12);
+  const bootstrapRowsPromise = listHomepageMonitorRows(db, includeHiddenMonitors);
   const [settings, summaryData, bootstrapRows, activeIncidents, maintenanceWindows, historyPreviews] =
     await Promise.all([
       settingsPromise,
@@ -1012,7 +1012,7 @@ export async function computePublicHomepageArtifactPayload(
 
   return {
     generated_at: now,
-    bootstrap_mode: summaryData.monitorCountTotal > monitors.length ? 'partial' : 'full',
+    bootstrap_mode: 'full',
     monitor_count_total: summaryData.monitorCountTotal,
     site_title: settings.site_title,
     site_description: settings.site_description,
