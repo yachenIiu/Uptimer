@@ -85,13 +85,24 @@ async function readSnapshotRow(
       readSnapshotStatementByDb.set(db, statement);
     }
 
-    return await statement
-      .bind(key)
-      .first<{ generated_at: number; body_json: string }>();
+    return await statement.bind(key).first<{ generated_at: number; body_json: string }>();
   } catch (err) {
     console.warn('homepage snapshot: read failed', err);
     return null;
   }
+}
+
+export async function readHomepageSnapshotGeneratedAt(db: D1Database): Promise<number | null> {
+  const row = await readSnapshotRow(db, SNAPSHOT_KEY);
+  return row?.generated_at ?? null;
+}
+
+export async function readHomepageArtifactSnapshotGeneratedAt(
+  db: D1Database,
+): Promise<number | null> {
+  const row =
+    (await readSnapshotRow(db, SNAPSHOT_ARTIFACT_KEY)) ?? (await readSnapshotRow(db, SNAPSHOT_KEY));
+  return row?.generated_at ?? null;
 }
 
 export function applyHomepageCacheHeaders(res: Response, ageSeconds: number): void {

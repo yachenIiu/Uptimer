@@ -10,14 +10,12 @@ import {
 import type { HttpResponseMatchMode, MonitorStatus } from '@uptimer/db/schema';
 
 import type { Env } from '../env';
-import { runHttpCheck } from '../monitor/http';
 import {
   computeNextState,
   type MonitorStateSnapshot,
   type NextState,
   type OutageAction,
 } from '../monitor/state-machine';
-import { runTcpCheck } from '../monitor/tcp';
 import type { CheckOutcome } from '../monitor/types';
 import type { WebhookChannel } from '../notify/webhook';
 import { readSettings } from '../settings';
@@ -95,6 +93,8 @@ type CachedMonitorHttpJson = {
 
 const cachedMonitorHttpJsonById = new Map<number, CachedMonitorHttpJson>();
 let webhookModulePromise: Promise<typeof import('../notify/webhook')> | null = null;
+let httpCheckModulePromise: Promise<typeof import('../monitor/http')> | null = null;
+let tcpCheckModulePromise: Promise<typeof import('../monitor/tcp')> | null = null;
 
 type DueMonitorRow = {
   id: number;
@@ -136,6 +136,16 @@ type NotifyContext = {
 async function getWebhookDispatchModule() {
   webhookModulePromise ??= import('../notify/webhook');
   return await webhookModulePromise;
+}
+
+async function getHttpCheckModule() {
+  httpCheckModulePromise ??= import('../monitor/http');
+  return await httpCheckModulePromise;
+}
+
+async function getTcpCheckModule() {
+  tcpCheckModulePromise ??= import('../monitor/tcp');
+  return await tcpCheckModulePromise;
 }
 
 const listActiveWebhookChannelsStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
@@ -466,14 +476,7 @@ function buildPersistStatements(
   completed: CompletedDueMonitor,
   templates: PersistStatementTemplates,
 ): D1PreparedStatement[] {
-  const {
-    row,
-    checkedAt,
-    outcome,
-    next,
-    outageAction,
-    stateLastError,
-  } = completed;
+  const { row, checkedAt, outcome, next, outageAction, stateLastError } = completed;
   const checkError = outcome.status === 'up' ? null : outcome.error;
 
   const statements: D1PreparedStatement[] = [];
@@ -515,13 +518,9 @@ function buildPersistStatements(
       ),
     );
   } else if (outageAction === 'close') {
-    statements.push(
-      templates.closeOutage.bind(checkedAt, row.id),
-    );
+    statements.push(templates.closeOutage.bind(checkedAt, row.id));
   } else if (outageAction === 'update' && checkError) {
-    statements.push(
-      templates.updateOutageLastError.bind(checkError, row.id),
-    );
+    statements.push(templates.updateOutageLastError.bind(checkError, row.id));
   }
 
   return statements;
@@ -584,6 +583,7 @@ async function runDueMonitor(
           });
         }
 
+        const { runHttpCheck } = await getHttpCheckModule();
         outcome = await runHttpCheck({
           url: row.target,
           timeoutMs: row.timeout_ms,
@@ -598,6 +598,7 @@ async function runDueMonitor(
         });
       }
     } else if (row.type === 'tcp') {
+      const { runTcpCheck } = await getTcpCheckModule();
       outcome = await runTcpCheck({ target: row.target, timeoutMs: row.timeout_ms });
     } else {
       outcome = {
@@ -854,14 +855,7 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
   const limit = pLimit(CHECK_CONCURRENCY);
   const settled = await Promise.allSettled(
     due.map((m) =>
-      limit(() =>
-        runDueMonitor(
-          m,
-          checkedAt,
-          suppressedMonitorIds.has(m.id),
-          stateMachineConfig,
-        ),
-      ),
+      limit(() => runDueMonitor(m, checkedAt, suppressedMonitorIds.has(m.id), stateMachineConfig)),
     ),
   );
 
