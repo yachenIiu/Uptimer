@@ -1452,24 +1452,6 @@ export function homepageFromStatusPayload(
   };
 }
 
-function cloneHomepageMonitorCard(monitor: HomepageMonitorCard): HomepageMonitorCard {
-  return {
-    ...monitor,
-    heartbeat_strip: {
-      checked_at: [...monitor.heartbeat_strip.checked_at],
-      status_codes: monitor.heartbeat_strip.status_codes,
-      latency_ms: [...monitor.heartbeat_strip.latency_ms],
-    },
-    uptime_30d: monitor.uptime_30d ? { ...monitor.uptime_30d } : null,
-    uptime_day_strip: {
-      day_start_at: [...monitor.uptime_day_strip.day_start_at],
-      downtime_sec: [...monitor.uptime_day_strip.downtime_sec],
-      unknown_sec: [...monitor.uptime_day_strip.unknown_sec],
-      uptime_pct_milli: [...monitor.uptime_day_strip.uptime_pct_milli],
-    },
-  };
-}
-
 function sameIncidentSummary(
   left: IncidentSummary | null | undefined,
   right: IncidentSummary | null | undefined,
@@ -1632,7 +1614,16 @@ export function tryPatchPublicHomepagePayloadFromRuntimeUpdates(opts: {
   }
 
   const todayStartAt = utcDayStart(now);
-  const nextMonitors = baseSnapshot.monitors.map((monitor) => {
+  const patchedMonitors: HomepageMonitorCard[] = [];
+  const summary: PublicHomepageResponse['summary'] = {
+    up: 0,
+    down: 0,
+    maintenance: 0,
+    paused: 0,
+    unknown: 0,
+  };
+
+  for (const monitor of baseSnapshot.monitors) {
     const update = updateById.get(monitor.id);
     if (!update) {
       return null;
@@ -1651,7 +1642,6 @@ export function tryPatchPublicHomepagePayloadFromRuntimeUpdates(opts: {
       return null;
     }
 
-    const nextMonitor = cloneHomepageMonitorCard(monitor);
     const segmentStart = Math.max(todayStartAt, baseSnapshot.generated_at, update.created_at);
     const segmentEnd = Math.max(segmentStart, Math.min(update.checked_at, now));
     const segment = computePatchedHomepageSegmentTotals({
@@ -1663,80 +1653,69 @@ export function tryPatchPublicHomepagePayloadFromRuntimeUpdates(opts: {
       segmentEnd,
     });
 
-    nextMonitor.last_checked_at = update.checked_at;
-    nextMonitor.status = toMonitorStatus(update.next_status) ?? 'unknown';
-    nextMonitor.is_stale = false;
-
-    nextMonitor.heartbeat_strip.checked_at.unshift(update.checked_at);
-    nextMonitor.heartbeat_strip.latency_ms.unshift(
+    const nextCheckedAt = [
+      update.checked_at,
+      ...monitor.heartbeat_strip.checked_at.slice(0, HEARTBEAT_POINTS - 1),
+    ];
+    const nextLatencyMs = [
       normalizeRuntimeUpdateLatencyMs(update.latency_ms),
-    );
-    nextMonitor.heartbeat_strip.status_codes = `${toHeartbeatStatusCode(update.check_status)}${nextMonitor.heartbeat_strip.status_codes}`;
-    if (nextMonitor.heartbeat_strip.checked_at.length > HEARTBEAT_POINTS) {
-      nextMonitor.heartbeat_strip.checked_at.length = HEARTBEAT_POINTS;
-    }
-    if (nextMonitor.heartbeat_strip.latency_ms.length > HEARTBEAT_POINTS) {
-      nextMonitor.heartbeat_strip.latency_ms.length = HEARTBEAT_POINTS;
-    }
-    if (nextMonitor.heartbeat_strip.status_codes.length > HEARTBEAT_POINTS) {
-      nextMonitor.heartbeat_strip.status_codes = nextMonitor.heartbeat_strip.status_codes.slice(
-        0,
-        HEARTBEAT_POINTS,
-      );
-    }
+      ...monitor.heartbeat_strip.latency_ms.slice(0, HEARTBEAT_POINTS - 1),
+    ];
+    const nextStatusCodes = `${toHeartbeatStatusCode(update.check_status)}${monitor.heartbeat_strip.status_codes.slice(0, HEARTBEAT_POINTS - 1)}`;
 
-    const todayIndex = nextMonitor.uptime_day_strip.day_start_at.findIndex(
+    const dayStartAt = [...monitor.uptime_day_strip.day_start_at];
+    const downtimeSec = [...monitor.uptime_day_strip.downtime_sec];
+    const unknownSec = [...monitor.uptime_day_strip.unknown_sec];
+    const uptimePctMilli = [...monitor.uptime_day_strip.uptime_pct_milli];
+
+    const todayIndex = dayStartAt.findIndex(
       (dayStart) => dayStart === todayStartAt,
     );
-    const bucketIndex =
-      todayIndex >= 0
-        ? todayIndex
-        : nextMonitor.uptime_day_strip.day_start_at.push(todayStartAt) - 1;
+    let bucketIndex = todayIndex;
     if (todayIndex < 0) {
-      nextMonitor.uptime_day_strip.downtime_sec.push(0);
-      nextMonitor.uptime_day_strip.unknown_sec.push(0);
-      nextMonitor.uptime_day_strip.uptime_pct_milli.push(null);
+      bucketIndex = dayStartAt.push(todayStartAt) - 1;
+      downtimeSec.push(0);
+      unknownSec.push(0);
+      uptimePctMilli.push(null);
     }
 
-    const currentDowntime = Math.max(
-      0,
-      nextMonitor.uptime_day_strip.downtime_sec[bucketIndex] ?? 0,
-    );
-    const currentUnknown = Math.max(0, nextMonitor.uptime_day_strip.unknown_sec[bucketIndex] ?? 0);
+    const currentDowntime = Math.max(0, downtimeSec[bucketIndex] ?? 0);
+    const currentUnknown = Math.max(0, unknownSec[bucketIndex] ?? 0);
     const totalSec = Math.max(0, now - Math.max(todayStartAt, update.created_at));
-    const downtimeSec = currentDowntime + segment.downtimeSec;
-    const unknownSec = currentUnknown + segment.unknownSec;
-    const uptimeSec = Math.max(0, totalSec - downtimeSec - unknownSec);
+    const nextDowntimeSec = currentDowntime + segment.downtimeSec;
+    const nextUnknownSec = currentUnknown + segment.unknownSec;
+    const nextUptimeSec = Math.max(0, totalSec - nextDowntimeSec - nextUnknownSec);
 
-    nextMonitor.uptime_day_strip.downtime_sec[bucketIndex] = downtimeSec;
-    nextMonitor.uptime_day_strip.unknown_sec[bucketIndex] = unknownSec;
-    nextMonitor.uptime_day_strip.uptime_pct_milli[bucketIndex] =
-      totalSec === 0 ? null : Math.round((uptimeSec * 100000) / totalSec);
+    downtimeSec[bucketIndex] = nextDowntimeSec;
+    unknownSec[bucketIndex] = nextUnknownSec;
+    uptimePctMilli[bucketIndex] =
+      totalSec === 0 ? null : Math.round((nextUptimeSec * 100000) / totalSec);
+    const nextMonitor: HomepageMonitorCard = {
+      ...monitor,
+      last_checked_at: update.checked_at,
+      status: toMonitorStatus(update.next_status) ?? 'unknown',
+      is_stale: false,
+      heartbeat_strip: {
+        checked_at: nextCheckedAt,
+        latency_ms: nextLatencyMs,
+        status_codes: nextStatusCodes,
+      },
+      uptime_30d: null,
+      uptime_day_strip: {
+        day_start_at: dayStartAt,
+        downtime_sec: downtimeSec,
+        unknown_sec: unknownSec,
+        uptime_pct_milli: uptimePctMilli,
+      },
+    };
     nextMonitor.uptime_30d = recomputePatchedHomepageUptime30d({
       monitor: nextMonitor,
       createdAt: update.created_at,
       now,
     });
 
-    return nextMonitor;
-  });
-
-  if (nextMonitors.some((monitor) => monitor === null)) {
-    return null;
-  }
-
-  const patchedMonitors = nextMonitors.filter(
-    (monitor): monitor is HomepageMonitorCard => monitor !== null,
-  );
-  const summary: PublicHomepageResponse['summary'] = {
-    up: 0,
-    down: 0,
-    maintenance: 0,
-    paused: 0,
-    unknown: 0,
-  };
-  for (const monitor of patchedMonitors) {
-    summary[monitor.status] += 1;
+    summary[nextMonitor.status] += 1;
+    patchedMonitors.push(nextMonitor);
   }
 
   return {
