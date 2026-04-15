@@ -15,10 +15,6 @@ import {
   type OutageAction,
 } from '../monitor/state-machine';
 import type { CheckOutcome } from '../monitor/types';
-import {
-  computePublicHomepagePayload,
-  tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates,
-} from '../public/homepage';
 import { rebuildPublicMonitorRuntimeSnapshot } from '../public/monitor-runtime-bootstrap';
 import {
   normalizeRuntimeUpdateLatencyMs,
@@ -26,8 +22,6 @@ import {
   refreshPublicMonitorRuntimeSnapshot,
   type MonitorRuntimeUpdate,
 } from '../public/monitor-runtime';
-import { toHomepageSnapshotPayload, writeHomepageSnapshot } from '../snapshots/public-homepage';
-import { readHomepageRefreshBaseSnapshot } from '../snapshots/public-homepage-read';
 import { readSettings } from '../settings';
 import { acquireLease, releaseLease } from './lock';
 import type { NotifyContext } from './notifications';
@@ -36,6 +30,7 @@ const LOCK_NAME = 'scheduler:tick';
 const LOCK_LEASE_SECONDS = 135;
 const INTERNAL_SCHEDULED_BATCH_SIZE = 6;
 const INTERNAL_SCHEDULED_BATCH_CONCURRENCY = 2;
+const HOMEPAGE_REFRESH_SERVICE_TIMEOUT_MS = 15_000;
 const INTERNAL_SCHEDULED_CHECK_BATCH_TIMEOUT_MS = 30_000;
 
 const CHECK_CONCURRENCY = 5;
@@ -49,70 +44,33 @@ const PERSIST_BATCH_SIZE = Math.max(
   ),
 );
 
-async function refreshHomepageSnapshotInline(
-  env: Env,
-  now: number,
-  runtimeUpdates?: MonitorRuntimeUpdate[],
-): Promise<void> {
-  if (!runtimeUpdates?.length) {
-    const [{ refreshPublicHomepageSnapshotIfNeeded }] = await Promise.all([import('../snapshots')]);
-    const baseSnapshot = await readHomepageRefreshBaseSnapshot(env.DB, now);
+async function refreshHomepageSnapshotInline(env: Env, now: number): Promise<void> {
+  const [
+    { computePublicHomepagePayload },
+    { refreshPublicHomepageSnapshotIfNeeded },
+    { readHomepageRefreshBaseSnapshot },
+  ] = await Promise.all([
+    import('../public/homepage'),
+    import('../snapshots'),
+    import('../snapshots/public-homepage-read'),
+  ]);
+  const baseSnapshot = await readHomepageRefreshBaseSnapshot(env.DB, now);
 
-    await refreshPublicHomepageSnapshotIfNeeded({
-      db: env.DB,
-      now,
-      compute: () =>
-        computePublicHomepagePayload(env.DB, now, {
-          baseSnapshot: baseSnapshot.snapshot,
-          baseSnapshotBodyJson: null,
-        }),
-      seedDataSnapshot: baseSnapshot.seedDataSnapshot,
-    });
-    return;
-  }
-
-  const acquired = await acquireLease(env.DB, 'snapshot:homepage:refresh', now, 55);
-  if (!acquired) {
-    return;
-  }
-
-  try {
-    const baseSnapshot = await readHomepageRefreshBaseSnapshot(env.DB, now);
-    if (
-      baseSnapshot.generatedAt !== null &&
-      Math.floor(baseSnapshot.generatedAt / 60) === Math.floor(now / 60)
-    ) {
-      return;
-    }
-
-    const fastPayload = baseSnapshot.snapshot
-      ? await tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates({
-          db: env.DB,
-          now,
-          baseSnapshot: baseSnapshot.snapshot,
-          baseSnapshotBodyJson: null,
-          updates: runtimeUpdates,
-        })
-      : null;
-
-    const payload =
-      fastPayload ??
-      (await computePublicHomepagePayload(env.DB, now, {
+  await refreshPublicHomepageSnapshotIfNeeded({
+    db: env.DB,
+    now,
+    compute: () =>
+      computePublicHomepagePayload(env.DB, now, {
         baseSnapshot: baseSnapshot.snapshot,
         baseSnapshotBodyJson: null,
-      }));
-
-    await writeHomepageSnapshot(
-      env.DB,
-      now,
-      toHomepageSnapshotPayload(payload),
-      undefined,
-      baseSnapshot.seedDataSnapshot,
-    );
-  } finally {
-    await releaseLease(env.DB, 'snapshot:homepage:refresh', now + 55);
-  }
+      }),
+    seedDataSnapshot: baseSnapshot.seedDataSnapshot,
+  });
 }
+
+type HomepageRefreshServiceResult = {
+  refreshed: boolean | null;
+};
 
 type MonitorBatchStats = {
   processedCount: number;
@@ -145,6 +103,36 @@ type ScheduledCheckBatchServiceContext = {
   allowNotifications: boolean;
 };
 
+function readScheduledTraceToken(env: Env): string | null {
+  const rawEnv = env as unknown as Record<string, unknown>;
+  const raw = rawEnv.UPTIMER_TRACE_TOKEN ?? rawEnv.TRACE_TOKEN;
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function isTruthyEnvFlag(value: unknown): boolean {
+  if (typeof value !== 'string') {
+    return false;
+  }
+  const normalized = value.trim().toLowerCase();
+  return (
+    normalized === '1' ||
+    normalized === 'true' ||
+    normalized === 'yes' ||
+    normalized === 'on'
+  );
+}
+
+function shouldTraceScheduledRefresh(env: Env): boolean {
+  const rawEnv = env as unknown as Record<string, unknown>;
+  return isTruthyEnvFlag(
+    rawEnv.UPTIMER_TRACE_SCHEDULED_REFRESH ?? rawEnv.TRACE_SCHEDULED_REFRESH,
+  );
+}
+
 async function fetchSelfWithTimeout(
   env: Env,
   request: Request,
@@ -167,6 +155,68 @@ async function fetchSelfWithTimeout(
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function refreshHomepageSnapshotViaService(
+  env: Env,
+  opts: {
+    runtimeUpdates?: MonitorRuntimeUpdate[];
+  } = {},
+): Promise<HomepageRefreshServiceResult> {
+  if (!env.ADMIN_TOKEN) {
+    throw new Error('ADMIN_TOKEN missing');
+  }
+
+  const runtimeUpdates = opts.runtimeUpdates?.length ? opts.runtimeUpdates : undefined;
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${env.ADMIN_TOKEN}`,
+    'Content-Type': runtimeUpdates
+      ? 'application/json; charset=utf-8'
+      : 'text/plain; charset=utf-8',
+    'X-Uptimer-Refresh-Source': 'scheduled',
+  };
+  if (shouldTraceScheduledRefresh(env)) {
+    headers['X-Uptimer-Trace'] = '1';
+    headers['X-Uptimer-Trace-Id'] = crypto.randomUUID();
+    headers['X-Uptimer-Trace-Mode'] = 'scheduled';
+    const traceToken = readScheduledTraceToken(env);
+    if (traceToken) {
+      headers['X-Uptimer-Trace-Token'] = traceToken;
+    }
+  }
+  const res = await fetchSelfWithTimeout(
+    env,
+    new Request('http://internal/api/v1/internal/refresh/homepage', {
+      method: 'POST',
+      headers,
+      body: runtimeUpdates
+        ? JSON.stringify({
+            token: env.ADMIN_TOKEN,
+            runtime_updates: runtimeUpdates,
+          })
+        : env.ADMIN_TOKEN,
+    }),
+    HOMEPAGE_REFRESH_SERVICE_TIMEOUT_MS,
+    'homepage refresh service',
+  );
+
+  const bodyText = await res.text().catch(() => '');
+  if (!res.ok) {
+    throw new Error(`service refresh failed: HTTP ${res.status} ${bodyText}`.trim());
+  }
+  let refreshed: boolean | null = null;
+  if (bodyText) {
+    try {
+      const parsed = JSON.parse(bodyText) as { refreshed?: unknown };
+      refreshed = typeof parsed.refreshed === 'boolean' ? parsed.refreshed : null;
+    } catch {
+      refreshed = null;
+    }
+  }
+
+  return {
+    refreshed,
+  };
 }
 
 function toInteger(value: unknown): number | null {
@@ -973,9 +1023,19 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
   const claimedLeaseExpiresAt = now + LOCK_LEASE_SECONDS;
   const totalStart = performance.now();
   const queueHomepageRefresh = (runtimeUpdates?: MonitorRuntimeUpdate[]) =>
-    refreshHomepageSnapshotInline(env, now, runtimeUpdates).catch((err) => {
-      console.warn('homepage snapshot: refresh failed', err);
-    });
+    env.SELF
+      ? refreshHomepageSnapshotViaService(
+          env,
+          runtimeUpdates ? { runtimeUpdates } : undefined,
+        ).catch(async (err) => {
+          console.warn('homepage snapshot: service refresh failed', err);
+          await refreshHomepageSnapshotInline(env, now).catch((fallbackErr) => {
+            console.warn('homepage snapshot: refresh failed', fallbackErr);
+          });
+        })
+      : refreshHomepageSnapshotInline(env, now).catch((err) => {
+          console.warn('homepage snapshot: refresh failed', err);
+        });
 
   const acquired = await acquireLease(env.DB, LOCK_NAME, now, LOCK_LEASE_SECONDS);
   if (!acquired) {
