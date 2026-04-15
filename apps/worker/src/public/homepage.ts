@@ -430,10 +430,7 @@ function canReuseBaseSnapshotMonitorMetadata(opts: {
   }
 
   const monitorIds = baseSnapshot.monitors.map((monitor) => monitor.id);
-  if (
-    runtimeSnapshot.monitors.length !== metadataStamp.monitorCountTotal ||
-    !snapshotHasMonitorIds(runtimeSnapshot, monitorIds)
-  ) {
+  if (!snapshotHasMonitorIds(runtimeSnapshot, monitorIds)) {
     return false;
   }
 
