@@ -283,10 +283,6 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
           snapshotMod.toHomepageSnapshotPayload(computed),
         )
       : snapshotMod.toHomepageSnapshotPayload(computed);
-    const writePayloadSnapshot = skipInitialFreshnessCheck || baseSnapshot.seedDataSnapshot;
-    if (trace?.enabled && writePayloadSnapshot) {
-      trace.setLabel('write_payload_snapshot', '1');
-    }
     if (trace) {
       await trace.timeAsync(
         'homepage_refresh_write',
@@ -296,7 +292,7 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
             now,
             payload,
             trace,
-            writePayloadSnapshot,
+            baseSnapshot.seedDataSnapshot,
           ),
       );
     } else {
@@ -305,7 +301,7 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
         now,
         payload,
         undefined,
-        writePayloadSnapshot,
+        baseSnapshot.seedDataSnapshot,
       );
     }
 
