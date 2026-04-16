@@ -1169,6 +1169,246 @@ describe('computePublicHomepagePayload', () => {
     });
   });
 
+  it('reuses the direct scheduled patch path when the base snapshot is older than the snapshot freshness window', async () => {
+    const dayStart = 1_728_000_000;
+    const baseNow = dayStart + 40;
+    const now = dayStart + 120;
+    const baseSnapshot = {
+      generated_at: baseNow,
+      bootstrap_mode: 'full' as const,
+      monitor_count_total: 1,
+      site_title: 'Status Hub',
+      site_description: 'Production services',
+      site_locale: 'en' as const,
+      site_timezone: 'UTC',
+      uptime_rating_level: 4 as const,
+      overall_status: 'up' as const,
+      banner: {
+        source: 'monitors' as const,
+        status: 'operational' as const,
+        title: 'All Systems Operational',
+      },
+      summary: {
+        up: 1,
+        down: 0,
+        maintenance: 0,
+        paused: 0,
+        unknown: 0,
+      },
+      monitors: [
+        {
+          id: 1,
+          name: 'API',
+          type: 'http' as const,
+          group_name: 'Core',
+          status: 'up' as const,
+          is_stale: false,
+          last_checked_at: baseNow,
+          heartbeat_strip: {
+            checked_at: [baseNow],
+            status_codes: 'u',
+            latency_ms: [42],
+          },
+          uptime_30d: { uptime_pct: 100 },
+          uptime_day_strip: {
+            day_start_at: [dayStart],
+            downtime_sec: [0],
+            unknown_sec: [0],
+            uptime_pct_milli: [100_000],
+          },
+        },
+      ],
+      active_incidents: [],
+      maintenance_windows: {
+        active: [],
+        upcoming: [],
+      },
+      resolved_incident_preview: null,
+      maintenance_history_preview: null,
+    };
+
+    const handlers: FakeD1QueryHandler[] = [
+      {
+        match: 'has_resolved_incident_preview',
+        first: () => ({
+          site_title_value: 'Status Hub',
+          site_description_value: 'Production services',
+          site_locale_value: 'en',
+          site_timezone_value: 'UTC',
+          uptime_rating_level_value: '4',
+          monitor_count_total: 1,
+          max_updated_at: baseNow,
+          has_active_incidents: 0,
+          has_resolved_incident_preview: 0,
+          has_active_maintenance: 0,
+          has_upcoming_maintenance: 0,
+          has_maintenance_history_preview: 0,
+        }),
+      },
+    ];
+
+    const payload = await tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates({
+      db: createFakeD1Database(handlers),
+      now,
+      baseSnapshot,
+      baseSnapshotBodyJson: null,
+      updates: [
+        {
+          monitor_id: 1,
+          interval_sec: 60,
+          created_at: dayStart - 86_400,
+          checked_at: baseNow + 60,
+          check_status: 'up',
+          next_status: 'up',
+          latency_ms: 55,
+        },
+      ],
+    });
+
+    expect(payload).not.toBeNull();
+    expect(payload?.generated_at).toBe(now);
+    expect(payload?.monitors[0]?.last_checked_at).toBe(baseNow + 60);
+    expect(payload?.monitors[0]?.heartbeat_strip.checked_at).toEqual([baseNow + 60, baseNow]);
+    expect(payload?.monitors[0]?.heartbeat_strip.latency_ms).toEqual([55, 42]);
+    expect(payload?.summary).toEqual({
+      up: 1,
+      down: 0,
+      maintenance: 0,
+      paused: 0,
+      unknown: 0,
+    });
+  });
+
+  it('reuses the runtime snapshot metadata patch path when the base snapshot is older than the snapshot freshness window', async () => {
+    const dayStart = 1_728_000_000;
+    const baseNow = dayStart + 40;
+    const now = dayStart + 130;
+    const baseSnapshot = {
+      generated_at: baseNow,
+      bootstrap_mode: 'full' as const,
+      monitor_count_total: 1,
+      site_title: 'Status Hub',
+      site_description: 'Production services',
+      site_locale: 'en' as const,
+      site_timezone: 'UTC',
+      uptime_rating_level: 4 as const,
+      overall_status: 'up' as const,
+      banner: {
+        source: 'monitors' as const,
+        status: 'operational' as const,
+        title: 'All Systems Operational',
+      },
+      summary: {
+        up: 1,
+        down: 0,
+        maintenance: 0,
+        paused: 0,
+        unknown: 0,
+      },
+      monitors: [
+        {
+          id: 1,
+          name: 'API',
+          type: 'http' as const,
+          group_name: 'Core',
+          status: 'up' as const,
+          is_stale: false,
+          last_checked_at: baseNow,
+          heartbeat_strip: {
+            checked_at: [baseNow],
+            status_codes: 'u',
+            latency_ms: [42],
+          },
+          uptime_30d: { uptime_pct: 100 },
+          uptime_day_strip: {
+            day_start_at: [dayStart],
+            downtime_sec: [0],
+            unknown_sec: [0],
+            uptime_pct_milli: [100_000],
+          },
+        },
+      ],
+      active_incidents: [],
+      maintenance_windows: {
+        active: [],
+        upcoming: [],
+      },
+      resolved_incident_preview: null,
+      maintenance_history_preview: null,
+    };
+
+    const handlers: FakeD1QueryHandler[] = [
+      {
+        match: 'has_resolved_incident_preview',
+        first: () => ({
+          site_title_value: 'Status Hub',
+          site_description_value: 'Production services',
+          site_locale_value: 'en',
+          site_timezone_value: 'UTC',
+          uptime_rating_level_value: '4',
+          monitor_count_total: 1,
+          max_updated_at: baseNow,
+          has_active_incidents: 0,
+          has_resolved_incident_preview: 0,
+          has_active_maintenance: 0,
+          has_upcoming_maintenance: 0,
+          has_maintenance_history_preview: 0,
+        }),
+      },
+      {
+        match: 'from public_snapshots',
+        first: () => ({
+          generated_at: now - 5,
+          body_json: JSON.stringify({
+            version: 1,
+            generated_at: now - 5,
+            day_start_at: dayStart,
+            monitors: [
+              {
+                monitor_id: 1,
+                created_at: dayStart - 86_400,
+                interval_sec: 120,
+                range_start_at: dayStart,
+                materialized_at: now - 5,
+                last_checked_at: baseNow,
+                last_status_code: 'u',
+                last_outage_open: false,
+                total_sec: 85,
+                downtime_sec: 0,
+                unknown_sec: 0,
+                uptime_sec: 85,
+                heartbeat_gap_sec: '',
+                heartbeat_latency_ms: [42],
+                heartbeat_status_codes: 'u',
+              },
+            ],
+          }),
+        }),
+      },
+    ];
+
+    const payload = await tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates({
+      db: createFakeD1Database(handlers),
+      now,
+      baseSnapshot,
+      baseSnapshotBodyJson: null,
+      updates: [],
+    });
+
+    expect(payload).not.toBeNull();
+    expect(payload?.generated_at).toBe(now);
+    expect(payload?.monitors[0]?.last_checked_at).toBe(baseNow);
+    expect(payload?.monitors[0]?.heartbeat_strip.checked_at).toEqual([baseNow]);
+    expect(payload?.monitors[0]?.status).toBe('up');
+    expect(payload?.summary).toEqual({
+      up: 1,
+      down: 0,
+      maintenance: 0,
+      paused: 0,
+      unknown: 0,
+    });
+  });
+
   it('falls back from the scheduled fast path when the latest resolved incident preview changes', async () => {
     const dayStart = 1_728_000_000;
     const baseNow = dayStart + 60;

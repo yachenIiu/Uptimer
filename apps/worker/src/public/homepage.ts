@@ -1589,10 +1589,6 @@ function tryPatchPublicHomepagePayloadFromRuntimeSnapshot(opts: {
     opts.trace?.setLabel('runtime_snapshot_patch_skip', 'base_ineligible');
     return null;
   }
-  if (Math.max(0, now - baseSnapshot.generated_at) > HOMEPAGE_FAST_PATCH_BASE_MAX_AGE_SECONDS) {
-    opts.trace?.setLabel('runtime_snapshot_patch_skip', 'base_stale');
-    return null;
-  }
   if (runtimeSnapshot.generated_at > now || runtimeSnapshot.day_start_at !== utcDayStart(now)) {
     opts.trace?.setLabel('runtime_snapshot_patch_skip', 'runtime_window');
     return null;
@@ -1836,9 +1832,6 @@ export function tryPatchPublicHomepagePayloadFromRuntimeUpdates(opts: {
 }): PublicHomepageResponse | null {
   const { baseSnapshot, now, updates } = opts;
   if (!baseSnapshot || !canPatchHomepageFromRuntime(baseSnapshot)) {
-    return null;
-  }
-  if (Math.max(0, now - baseSnapshot.generated_at) > HOMEPAGE_FAST_PATCH_BASE_MAX_AGE_SECONDS) {
     return null;
   }
   if (updates.length === 0 || updates.length !== baseSnapshot.monitors.length) {
