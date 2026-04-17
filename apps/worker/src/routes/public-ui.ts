@@ -849,40 +849,45 @@ publicUiRoutes.get('/analytics/uptime', async (c) => {
     return publicRoutes.fetch(c.req.raw, c.env, c.executionCtx);
   }
 
-  const { results: sumRows } = await c.env.DB
-    .prepare(
-      `
-        SELECT
-          monitor_id,
-          SUM(total_sec) AS total_sec,
-          SUM(downtime_sec) AS downtime_sec,
-          SUM(unknown_sec) AS unknown_sec,
-          SUM(uptime_sec) AS uptime_sec
-        FROM monitor_daily_rollups
-        WHERE day_start_at >= ?1 AND day_start_at < ?2
-        GROUP BY monitor_id
-      `,
-    )
-    .bind(rangeStart, rangeEndFullDays)
-    .all<{
-      monitor_id: number;
-      total_sec: number;
-      downtime_sec: number;
-      unknown_sec: number;
-      uptime_sec: number;
-    }>();
-
   const rollupByMonitorId = new Map<
     number,
     { total_sec: number; downtime_sec: number; unknown_sec: number; uptime_sec: number }
   >();
-  for (const row of sumRows ?? []) {
-    rollupByMonitorId.set(row.monitor_id, {
-      total_sec: row.total_sec ?? 0,
-      downtime_sec: row.downtime_sec ?? 0,
-      unknown_sec: row.unknown_sec ?? 0,
-      uptime_sec: row.uptime_sec ?? 0,
-    });
+  for (const ids of chunkPositiveIntegerIds(monitorIds, 90)) {
+    const placeholders = buildNumberedPlaceholders(ids.length, 3);
+    const { results: sumRows } = await c.env.DB
+      .prepare(
+        `
+          SELECT
+            monitor_id,
+            SUM(total_sec) AS total_sec,
+            SUM(downtime_sec) AS downtime_sec,
+            SUM(unknown_sec) AS unknown_sec,
+            SUM(uptime_sec) AS uptime_sec
+          FROM monitor_daily_rollups
+          WHERE day_start_at >= ?1
+            AND day_start_at < ?2
+            AND monitor_id IN (${placeholders})
+          GROUP BY monitor_id
+        `,
+      )
+      .bind(rangeStart, rangeEndFullDays, ...ids)
+      .all<{
+        monitor_id: number;
+        total_sec: number;
+        downtime_sec: number;
+        unknown_sec: number;
+        uptime_sec: number;
+      }>();
+
+    for (const row of sumRows ?? []) {
+      rollupByMonitorId.set(row.monitor_id, {
+        total_sec: row.total_sec ?? 0,
+        downtime_sec: row.downtime_sec ?? 0,
+        unknown_sec: row.unknown_sec ?? 0,
+        uptime_sec: row.uptime_sec ?? 0,
+      });
+    }
   }
 
   const runtimeByMonitorId = runtimeSnapshot ? toMonitorRuntimeEntryMap(runtimeSnapshot) : null;
