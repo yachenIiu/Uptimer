@@ -15,6 +15,10 @@ import {
 } from '../analytics/uptime';
 import {
   materializeMonitorRuntimeTotals,
+  MONITOR_RUNTIME_MAX_AGE_SECONDS,
+  MONITOR_RUNTIME_SNAPSHOT_KEY,
+  parsePublicMonitorRuntimeEntry,
+  type PublicMonitorRuntimeEntry,
   readPublicMonitorRuntimeSnapshot,
   snapshotHasMonitorIds,
   toMonitorRuntimeEntryMap,
@@ -349,6 +353,16 @@ function jsonArrayLiteral(value: string | null | undefined): string {
   return trimmed.startsWith('[') && trimmed.endsWith(']') ? trimmed : '[]';
 }
 
+function safeJsonParse(text: string): unknown | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    return null;
+  }
+}
+
 function toCheckStatus(value: string | null): 'up' | 'down' | 'maintenance' | 'unknown' {
   switch (value) {
     case 'up':
@@ -519,6 +533,56 @@ async function computePartialUptimeTotals(
   const uptime_sec = Math.max(0, total_sec - unavailable_sec);
 
   return { total_sec, downtime_sec, unknown_sec, uptime_sec };
+}
+
+async function readPublicMonitorRuntimeEntry(opts: {
+  db: D1Database;
+  now: number;
+  monitorId: number;
+  maxAgeSeconds?: number;
+}): Promise<PublicMonitorRuntimeEntry | null> {
+  const row = await opts.db
+    .prepare(
+      `
+        SELECT
+          generated_at,
+          CAST(json_extract(body_json, '$.day_start_at') AS INTEGER) AS day_start_at,
+          (
+            SELECT entry.value
+            FROM json_each(public_snapshots.body_json, '$.monitors') AS entry
+            WHERE CAST(json_extract(entry.value, '$.monitor_id') AS INTEGER) = ?2
+            LIMIT 1
+          ) AS monitor_json
+        FROM public_snapshots
+        WHERE key = ?1
+      `,
+    )
+    .bind(MONITOR_RUNTIME_SNAPSHOT_KEY, opts.monitorId)
+    .first<{
+      generated_at: number;
+      day_start_at: number | null;
+      monitor_json: string | null;
+    }>();
+
+  if (!row || typeof row.generated_at !== 'number') {
+    return null;
+  }
+
+  const age = Math.max(0, opts.now - row.generated_at);
+  if (age > (opts.maxAgeSeconds ?? MONITOR_RUNTIME_MAX_AGE_SECONDS)) {
+    return null;
+  }
+
+  if (row.day_start_at !== utcDayStart(opts.now) || typeof row.monitor_json !== 'string') {
+    return null;
+  }
+
+  const parsed = safeJsonParse(row.monitor_json);
+  if (parsed === null) {
+    return null;
+  }
+
+  return parsePublicMonitorRuntimeEntry(parsed);
 }
 
 async function buildCompactLatencyResponseJson(opts: {
@@ -1263,12 +1327,11 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
     }
 
     if (endDay < rangeEnd) {
-      const runtimeSnapshot = await readPublicMonitorRuntimeSnapshot(c.env.DB, rangeEnd);
-      const runtimeByMonitorId =
-        runtimeSnapshot && snapshotHasMonitorIds(runtimeSnapshot, [monitor.id])
-          ? toMonitorRuntimeEntryMap(runtimeSnapshot)
-          : null;
-      const runtimeEntry = runtimeByMonitorId?.get(monitor.id);
+      const runtimeEntry = await readPublicMonitorRuntimeEntry({
+        db: c.env.DB,
+        now: rangeEnd,
+        monitorId: monitor.id,
+      });
 
       if (runtimeEntry) {
         addUptimeTotals(totals, materializeMonitorRuntimeTotals(runtimeEntry, rangeEnd));

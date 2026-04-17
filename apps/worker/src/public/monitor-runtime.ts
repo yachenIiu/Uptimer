@@ -367,6 +367,11 @@ const runtimeEntrySchema = z
     }
   });
 
+export function parsePublicMonitorRuntimeEntry(value: unknown): PublicMonitorRuntimeEntry | null {
+  const parsed = runtimeEntrySchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
 export const publicMonitorRuntimeSnapshotSchema = z.object({
   version: z.literal(MONITOR_RUNTIME_SNAPSHOT_VERSION),
   generated_at: z.number().int().nonnegative(),
