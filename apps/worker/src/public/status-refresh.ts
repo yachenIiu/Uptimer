@@ -1,5 +1,6 @@
 import type { PublicStatusResponse } from '../schemas/public-status';
 import { readStatusSnapshotPayloadAnyAge } from '../snapshots/public-status-read';
+import type { SettingsResponse } from '../settings';
 
 import {
   fromRuntimeStatusCode,
@@ -16,7 +17,6 @@ import {
 
 import {
   buildPublicStatusBanner,
-  readPublicSiteSettings,
   toMonitorStatus,
   utcDayStart,
 } from './data';
@@ -32,7 +32,7 @@ const STATUS_FAST_PATCH_MAX_STALE_SECONDS = 10 * 60;
 const UPTIME_DAYS = 30;
 
 type StatusMonitor = PublicStatusResponse['monitors'][number];
-type StatusPublicSettings = Awaited<ReturnType<typeof readPublicSiteSettings>>;
+type StatusPublicSettings = SettingsResponse['settings'];
 type StatusMonitorMetadataStamp = {
   monitorCountTotal: number;
   maxUpdatedAt: number | null;
@@ -92,6 +92,75 @@ function computeOverallStatus(
           : summary.paused > 0
             ? 'paused'
             : 'unknown';
+}
+
+const STATUS_FAST_PUBLIC_LOCALES = new Set<StatusPublicSettings['site_locale']>([
+  'auto',
+  'en',
+  'zh-CN',
+  'zh-TW',
+  'ja',
+  'es',
+]);
+
+function normalizeStatusFastGuardString(
+  value: string | null | undefined,
+  opts: {
+    fallback: string;
+    max: number;
+    allowEmpty?: boolean;
+  },
+): string {
+  if (typeof value !== 'string') {
+    return opts.fallback;
+  }
+  if (!opts.allowEmpty && value.length === 0) {
+    return opts.fallback;
+  }
+  if (value.length > opts.max) {
+    return opts.fallback;
+  }
+  return value;
+}
+
+function normalizeStatusFastGuardSettings(row: {
+  site_title_value: string | null | undefined;
+  site_description_value: string | null | undefined;
+  site_locale_value: string | null | undefined;
+  site_timezone_value: string | null | undefined;
+  uptime_rating_level_value: string | null | undefined;
+}): StatusPublicSettings {
+  const parsedUptimeRating = Number.parseInt(row.uptime_rating_level_value ?? '', 10);
+
+  return {
+    site_title: normalizeStatusFastGuardString(row.site_title_value, {
+      fallback: 'Uptimer',
+      max: 100,
+    }),
+    site_description: normalizeStatusFastGuardString(row.site_description_value, {
+      fallback: '',
+      max: 500,
+      allowEmpty: true,
+    }),
+    site_locale: STATUS_FAST_PUBLIC_LOCALES.has(
+      (row.site_locale_value ?? '') as StatusPublicSettings['site_locale'],
+    )
+      ? ((row.site_locale_value ?? 'auto') as StatusPublicSettings['site_locale'])
+      : 'auto',
+    site_timezone: normalizeStatusFastGuardString(row.site_timezone_value, {
+      fallback: 'UTC',
+      max: 64,
+    }),
+    retention_check_results_days: 7,
+    state_failures_to_down_from_up: 2,
+    state_successes_to_up_from_down: 2,
+    admin_default_overview_range: '24h',
+    admin_default_monitor_range: '24h',
+    uptime_rating_level:
+      Number.isFinite(parsedUptimeRating) && parsedUptimeRating >= 1 && parsedUptimeRating <= 5
+        ? (parsedUptimeRating as 1 | 2 | 3 | 4 | 5)
+        : 3,
+  };
 }
 
 function hasMatchingStatusPublicSettings(
@@ -536,53 +605,96 @@ async function readStatusScheduledFastGuardState(
   const incidentVisibilitySql = incidentStatusPageVisibilityPredicate(includeHiddenMonitors);
   const maintenanceVisibilitySql =
     maintenanceWindowStatusPageVisibilityPredicate(includeHiddenMonitors);
-  const [settings, row] = await Promise.all([
-    readPublicSiteSettings(db),
-    getCachedStatusStatement(
-      db,
-      includeHiddenMonitors ? 'scheduledFastGuardIncludingHidden' : 'scheduledFastGuard',
-      () =>
-        db.prepare(
-          `
+  const row = await getCachedStatusStatement(
+    db,
+    includeHiddenMonitors ? 'scheduledFastGuardIncludingHidden' : 'scheduledFastGuard',
+    () =>
+      db.prepare(
+        `
           SELECT
-            COUNT(*) AS monitor_count_total,
-            MAX(COALESCE(m.updated_at, m.created_at, 0)) AS max_updated_at,
+            (
+              SELECT value
+              FROM settings
+              WHERE key = 'site_title'
+            ) AS site_title_value,
+            (
+              SELECT value
+              FROM settings
+              WHERE key = 'site_description'
+            ) AS site_description_value,
+            (
+              SELECT value
+              FROM settings
+              WHERE key = 'site_locale'
+            ) AS site_locale_value,
+            (
+              SELECT value
+              FROM settings
+              WHERE key = 'site_timezone'
+            ) AS site_timezone_value,
+            (
+              SELECT value
+              FROM settings
+              WHERE key = 'uptime_rating_level'
+            ) AS uptime_rating_level_value,
+            (
+              SELECT COUNT(*)
+              FROM monitors m
+              WHERE m.is_active = 1
+                AND ${monitorVisibilityPredicate(includeHiddenMonitors, 'm')}
+            ) AS monitor_count_total,
+            (
+              SELECT MAX(COALESCE(m.updated_at, m.created_at, 0))
+              FROM monitors m
+              WHERE m.is_active = 1
+                AND ${monitorVisibilityPredicate(includeHiddenMonitors, 'm')}
+            ) AS max_updated_at,
             EXISTS(
               SELECT 1
               FROM incidents
               WHERE status != 'resolved'
                 AND ${incidentVisibilitySql}
+              LIMIT 1
             ) AS has_active_incidents,
             EXISTS(
               SELECT 1
               FROM maintenance_windows
               WHERE starts_at <= ?1 AND ends_at > ?1
                 AND ${maintenanceVisibilitySql}
+              LIMIT 1
             ) AS has_active_maintenance,
             EXISTS(
               SELECT 1
               FROM maintenance_windows
               WHERE starts_at > ?1
                 AND ${maintenanceVisibilitySql}
+              LIMIT 1
             ) AS has_upcoming_maintenance
-          FROM monitors m
-          WHERE m.is_active = 1
-            AND ${monitorVisibilityPredicate(includeHiddenMonitors, 'm')}
         `,
-        ),
-    )
-      .bind(now)
-      .first<{
-        monitor_count_total: number | null;
-        max_updated_at: number | null;
-        has_active_incidents: number | null;
-        has_active_maintenance: number | null;
-        has_upcoming_maintenance: number | null;
-      }>(),
-  ]);
+      ),
+  )
+    .bind(now)
+    .first<{
+      site_title_value: string | null;
+      site_description_value: string | null;
+      site_locale_value: string | null;
+      site_timezone_value: string | null;
+      uptime_rating_level_value: string | null;
+      monitor_count_total: number | null;
+      max_updated_at: number | null;
+      has_active_incidents: number | null;
+      has_active_maintenance: number | null;
+      has_upcoming_maintenance: number | null;
+    }>();
 
   return {
-    settings,
+    settings: normalizeStatusFastGuardSettings({
+      site_title_value: row?.site_title_value,
+      site_description_value: row?.site_description_value,
+      site_locale_value: row?.site_locale_value,
+      site_timezone_value: row?.site_timezone_value,
+      uptime_rating_level_value: row?.uptime_rating_level_value,
+    }),
     monitorMetadataStamp: {
       monitorCountTotal: row?.monitor_count_total ?? 0,
       maxUpdatedAt: row?.max_updated_at ?? null,

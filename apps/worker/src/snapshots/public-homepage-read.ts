@@ -1022,17 +1022,14 @@ export async function readHomepageRefreshBaseSnapshot(
     return parsedRow;
   };
 
-  const refreshMetadataRows = await readRefreshSnapshotMetadataRows(db);
-  if (refreshMetadataRows.length === 0) {
-    const refreshRows = await readRefreshSnapshotRows(db);
-    for (const row of refreshRows) {
-      rowByKey.set(row.key, row);
-    }
+  const refreshRows = await readRefreshSnapshotRows(db);
+  for (const row of refreshRows) {
+    rowByKey.set(row.key, row);
   }
   const metadataRows =
-    refreshMetadataRows.length > 0
-      ? refreshMetadataRows
-      : [...rowByKey.values()].flatMap((row) => (row ? [toSnapshotRefreshMetadataRow(row)] : []));
+    refreshRows.length > 0
+      ? refreshRows.map(toSnapshotRefreshMetadataRow)
+      : await readRefreshSnapshotMetadataRows(db);
   const metadataByKey = new Map(metadataRows.map((row) => [row.key, row]));
   const homepageMetadata = metadataByKey.get(SNAPSHOT_KEY) ?? null;
   const artifactMetadata = metadataByKey.get(SNAPSHOT_ARTIFACT_KEY) ?? null;
