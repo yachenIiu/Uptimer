@@ -483,7 +483,11 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
   if (trace?.enabled) {
     trace.setLabel('runtime_updates_fast_path_count', fastPathRuntimeUpdates.length);
   }
-  const skipInitialFreshnessCheck = scheduledRefreshRequest && fastPathRuntimeUpdates.length > 0;
+  const scheduledRuntimeUpdatesRequested =
+    scheduledRefreshRequest && (runtimeUpdates?.length ?? 0) > 0;
+  const useScheduledRuntimeFastPath =
+    scheduledRefreshRequest && fastPathRuntimeUpdates.length > 0;
+  const skipInitialFreshnessCheck = scheduledRuntimeUpdatesRequested;
   if (trace?.enabled && skipInitialFreshnessCheck) {
     trace.setLabel('skip_initial_freshness_check', '1');
   }
@@ -585,8 +589,7 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
         baseSnapshot.generatedAt === null ? 'none' : Math.max(0, now - baseSnapshot.generatedAt),
       );
     }
-    const shouldHonorFreshAfterLeaseGate =
-      !(scheduledRefreshRequest && fastPathRuntimeUpdates.length > 0);
+    const shouldHonorFreshAfterLeaseGate = !scheduledRuntimeUpdatesRequested;
     if (
       shouldHonorFreshAfterLeaseGate &&
       baseSnapshot.generatedAt !== null &&
@@ -650,7 +653,7 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
         }
       | undefined;
     let payload =
-      skipInitialFreshnessCheck && baseSnapshot.snapshot
+      useScheduledRuntimeFastPath && baseSnapshot.snapshot
         ? trace
           ? await trace.timeAsync(
               'homepage_refresh_fast_compute',

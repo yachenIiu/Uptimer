@@ -792,6 +792,79 @@ describe('internal homepage refresh route', () => {
     expect(computePublicHomepagePayload).toHaveBeenCalledTimes(1);
   });
 
+  it('does not skip a fresh scheduled refresh when runtime updates cannot use the fast path', async () => {
+    const now = 1_776_230_340;
+    vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
+    const baseSnapshot = {
+      ...createBaseSnapshot(now),
+      generated_at: now,
+    };
+    const env = {
+      DB: createFakeD1Database([
+        {
+          match: (sql) =>
+            sql.includes('select key, generated_at, updated_at') &&
+            sql.includes('from public_snapshots') &&
+            !sql.includes('body_json'),
+          all: () => [
+            {
+              key: 'homepage',
+              generated_at: baseSnapshot.generated_at,
+              updated_at: baseSnapshot.generated_at,
+            },
+          ],
+        },
+        {
+          match: 'select key, generated_at, updated_at, body_json from public_snapshots',
+          all: () => [
+            {
+              key: 'homepage',
+              generated_at: baseSnapshot.generated_at,
+              updated_at: baseSnapshot.generated_at,
+              body_json: JSON.stringify(baseSnapshot),
+            },
+          ],
+        },
+        {
+          match: 'select generated_at, updated_at, body_json from public_snapshots',
+          first: () => null,
+        },
+      ]),
+      ADMIN_TOKEN: 'test-admin-token',
+    } as unknown as Env;
+    vi.mocked(tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates).mockResolvedValue(
+      null as never,
+    );
+    vi.mocked(computePublicHomepagePayload).mockResolvedValue({
+      ...baseSnapshot,
+      generated_at: now,
+    } as never);
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/refresh/homepage', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+          'X-Uptimer-Refresh-Source': 'scheduled',
+        },
+        body: JSON.stringify({
+          token: 'test-admin-token',
+          runtime_updates: [[1, 60, now - 300, now, 'up', 'up', 55]],
+        }),
+      }),
+      env,
+      { waitUntil: vi.fn() } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({ ok: true, refreshed: true });
+    expect(acquireLease).toHaveBeenCalledTimes(1);
+    expect(tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates).not.toHaveBeenCalled();
+    expect(computePublicHomepagePayload).toHaveBeenCalledTimes(1);
+    expect(writeHomepageSnapshot).toHaveBeenCalledTimes(1);
+  });
+
   it('fails closed when only monitor_state is available and the timestamp is ambiguous', async () => {
     const now = 1_776_230_340;
     vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
