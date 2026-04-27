@@ -308,51 +308,6 @@ describe('internal homepage refresh route', () => {
     );
   });
 
-  it('can skip the homepage refresh lease for trusted scheduled refreshes', async () => {
-    const now = 1_776_230_340;
-    vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
-    const env = createEnv(now);
-    env.UPTIMER_SCHEDULED_HOMEPAGE_SKIP_LEASE = '1';
-    const baseSnapshot = createBaseSnapshot(now);
-    const fastPayload = {
-      ...baseSnapshot,
-      generated_at: now,
-    };
-    vi.mocked(tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates).mockResolvedValue(
-      fastPayload as never,
-    );
-
-    const res = await worker.fetch(
-      new Request('http://internal/api/v1/internal/refresh/homepage', {
-        method: 'POST',
-        headers: {
-          Authorization: 'Bearer test-admin-token',
-          'Content-Type': 'application/json; charset=utf-8',
-          'X-Uptimer-Refresh-Source': 'scheduled',
-        },
-        body: JSON.stringify({
-          token: 'test-admin-token',
-          runtime_updates: [[1, 60, now - 300, now, 'up', 'up', 55]],
-        }),
-      }),
-      env,
-      { waitUntil: vi.fn() } as unknown as ExecutionContext,
-    );
-
-    expect(res.status).toBe(200);
-    expect(acquireLease).not.toHaveBeenCalled();
-    expect(releaseLease).not.toHaveBeenCalled();
-    expect(prepareHomepageSnapshotWrite).toHaveBeenCalledWith(
-      env.DB,
-      now,
-      fastPayload,
-      undefined,
-      false,
-      undefined,
-      true,
-    );
-  });
-
   it('writes a patched status snapshot when the scheduled fast path can produce one', async () => {
     const now = 1_776_230_340;
     vi.spyOn(Date, 'now').mockReturnValue(now * 1000);

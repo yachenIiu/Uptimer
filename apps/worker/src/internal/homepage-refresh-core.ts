@@ -334,14 +334,8 @@ export async function runInternalHomepageRefreshCore({
   const useScheduledRuntimeFastPath =
     scheduledRefreshRequest && fastPathRuntimeUpdates.length > 0;
   const skipInitialFreshnessCheck = scheduledRuntimeUpdatesRequested;
-  const skipScheduledHomepageLease =
-    scheduledRefreshRequest &&
-    normalizeInternalTruthy(env.UPTIMER_SCHEDULED_HOMEPAGE_SKIP_LEASE ?? null);
   if (trace?.enabled && skipInitialFreshnessCheck) {
     trace.setLabel('skip_initial_freshness_check', '1');
-  }
-  if (trace?.enabled && skipScheduledHomepageLease) {
-    trace.setLabel('homepage_refresh_lease', 'trusted_scheduled_skip');
   }
 
   let claimedLeaseExpiresAt: number | null = null;
@@ -376,47 +370,45 @@ export async function runInternalHomepageRefreshCore({
       }
     }
 
-    if (!skipScheduledHomepageLease) {
-      const { acquireLease, releaseLease } = trace
-        ? await trace.timeAsync(
-            'import_scheduler_lock_module',
-            async () => await import('../scheduler/lock'),
-          )
-        : await import('../scheduler/lock');
-      releaseHomepageRefreshLease = releaseLease;
-      const acquired = trace
-        ? await trace.timeAsync(
-            'homepage_refresh_lease',
-            async () =>
-              await acquireLease(
-                env.DB,
-                HOMEPAGE_REFRESH_LOCK_NAME,
-                now,
-                HOMEPAGE_REFRESH_LOCK_LEASE_SECONDS,
-              ),
-          )
-        : await acquireLease(
-            env.DB,
-            HOMEPAGE_REFRESH_LOCK_NAME,
-            now,
-            HOMEPAGE_REFRESH_LOCK_LEASE_SECONDS,
-          );
-      if (!acquired) {
-        trace?.setLabel('skip', 'lease');
-        return toInternalHomepageRefreshCoreResult(true, false, { skip: 'lease' });
-      }
-
-      claimedLeaseExpiresAt = now + HOMEPAGE_REFRESH_LOCK_LEASE_SECONDS;
-      homepageRefreshLease = startRenewableLease({
-        db: env.DB,
-        name: HOMEPAGE_REFRESH_LOCK_NAME,
-        leaseSeconds: HOMEPAGE_REFRESH_LOCK_LEASE_SECONDS,
-        initialExpiresAt: claimedLeaseExpiresAt,
-        renewIntervalMs: HOMEPAGE_REFRESH_LOCK_RENEW_INTERVAL_MS,
-        renewMinRemainingSeconds: HOMEPAGE_REFRESH_LOCK_RENEW_MIN_REMAINING_SECONDS,
-        logPrefix: 'internal refresh',
-      });
+    const { acquireLease, releaseLease } = trace
+      ? await trace.timeAsync(
+          'import_scheduler_lock_module',
+          async () => await import('../scheduler/lock'),
+        )
+      : await import('../scheduler/lock');
+    releaseHomepageRefreshLease = releaseLease;
+    const acquired = trace
+      ? await trace.timeAsync(
+          'homepage_refresh_lease',
+          async () =>
+            await acquireLease(
+              env.DB,
+              HOMEPAGE_REFRESH_LOCK_NAME,
+              now,
+              HOMEPAGE_REFRESH_LOCK_LEASE_SECONDS,
+            ),
+        )
+      : await acquireLease(
+          env.DB,
+          HOMEPAGE_REFRESH_LOCK_NAME,
+          now,
+          HOMEPAGE_REFRESH_LOCK_LEASE_SECONDS,
+        );
+    if (!acquired) {
+      trace?.setLabel('skip', 'lease');
+      return toInternalHomepageRefreshCoreResult(true, false, { skip: 'lease' });
     }
+
+    claimedLeaseExpiresAt = now + HOMEPAGE_REFRESH_LOCK_LEASE_SECONDS;
+    homepageRefreshLease = startRenewableLease({
+      db: env.DB,
+      name: HOMEPAGE_REFRESH_LOCK_NAME,
+      leaseSeconds: HOMEPAGE_REFRESH_LOCK_LEASE_SECONDS,
+      initialExpiresAt: claimedLeaseExpiresAt,
+      renewIntervalMs: HOMEPAGE_REFRESH_LOCK_RENEW_INTERVAL_MS,
+      renewMinRemainingSeconds: HOMEPAGE_REFRESH_LOCK_RENEW_MIN_REMAINING_SECONDS,
+      logPrefix: 'internal refresh',
+    });
 
     const cachedBaseSnapshot = preferCachedBaseSnapshot
       ? readCachedHomepageRefreshBaseSnapshot(env.DB, now)
@@ -631,12 +623,12 @@ export async function runInternalHomepageRefreshCore({
       trace.setLabel('status_refresh', 'disabled');
     }
 
-    homepageRefreshLease?.assertHeld('writing homepage snapshot');
+    homepageRefreshLease.assertHeld('writing homepage snapshot');
     const activeHomepageRefreshLease = homepageRefreshLease;
     const shouldCheckHomepageWriteLease = !normalizeInternalFalsy(
       env.UPTIMER_HOMEPAGE_WRITE_LEASE_CHECK,
     );
-    const homepageWriteLease = shouldCheckHomepageWriteLease && activeHomepageRefreshLease
+    const homepageWriteLease = shouldCheckHomepageWriteLease
       ? {
           name: HOMEPAGE_REFRESH_LOCK_NAME,
           expiresAt: activeHomepageRefreshLease.getExpiresAt(),
@@ -692,7 +684,7 @@ export async function runInternalHomepageRefreshCore({
       : writeStatements.length > 1
         ? await env.DB.batch(writeStatements)
         : [await writeStatements[0]!.run()];
-    homepageRefreshLease?.assertHeld('finalizing snapshot writes');
+    homepageRefreshLease.assertHeld('finalizing snapshot writes');
     const inspectSnapshotWriteResults = () => {
       const homepageWriteResult = writeResults[0];
       if (!homepageWriteResult) {
