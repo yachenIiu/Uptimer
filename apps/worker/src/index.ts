@@ -6,7 +6,6 @@ import {
   normalizeInternalTruthy,
   runInternalHomepageRefreshCore,
 } from './internal/homepage-refresh-core';
-import { runInternalStatusRefreshCore } from './internal/status-refresh-core';
 import {
   encodeMonitorRuntimeUpdatesCompact,
   parseMonitorRuntimeUpdates,
@@ -252,35 +251,6 @@ function finalizeInternalCheckBatchResponse(
   return res;
 }
 
-function finalizeInternalStatusRefreshResponse(
-  res: Response,
-  trace: Trace | null,
-  traceMod: typeof import('./observability/trace') | null,
-  info: { refreshed?: boolean; error?: boolean },
-): Response {
-  if (!trace?.enabled || !traceMod) {
-    return res;
-  }
-
-  if (typeof info.refreshed === 'boolean') {
-    trace.setLabel('refreshed', info.refreshed);
-  }
-  if (info.error) {
-    trace.setLabel('error', '1');
-  }
-
-  trace.finish('total');
-  const traceInfo = trace.toInfoHeader();
-  const serverTiming = trace.toServerTiming('w');
-  traceMod.applyTraceToResponse({ res, trace, prefix: 'w', info: traceInfo, serverTiming });
-  console.log(
-    info.error
-      ? `internal-status-refresh: id=${trace.id} failed=1 timing=${serverTiming} info=${traceInfo}`
-      : `internal-status-refresh: id=${trace.id} refreshed=${info.refreshed} timing=${serverTiming} info=${traceInfo}`,
-  );
-  return res;
-}
-
 async function handleInternalHomepageRefresh(request: Request, env: Env): Promise<Response> {
   if (!isInternalServiceRequest(request)) {
     return buildNotFoundJsonResponse(request.headers.get('Origin'));
@@ -367,55 +337,6 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
     { refreshed: result.refreshed, ...(result.error ? { error: true } : {}) },
   );
 }
-async function handleInternalStatusRefresh(request: Request, env: Env): Promise<Response> {
-  if (!isInternalServiceRequest(request)) {
-    return buildNotFoundJsonResponse(request.headers.get('Origin'));
-  }
-  if (request.method !== 'POST') {
-    return new Response('Method Not Allowed', { status: 405 });
-  }
-  if (!hasValidInternalAuth(request, env)) {
-    return new Response('Forbidden', { status: 403 });
-  }
-  if (isRequestBodyTooLarge(request)) {
-    return new Response('Payload Too Large', { status: 413 });
-  }
-
-  let traceMod: typeof import('./observability/trace') | null = null;
-  let trace: Trace | null = null;
-  if (normalizeTruthyHeader(request.headers.get('X-Uptimer-Trace'))) {
-    traceMod = await import('./observability/trace');
-    trace = new traceMod.Trace(
-      traceMod.resolveTraceOptions({
-        header: (name) => request.headers.get(name) ?? undefined,
-        env: env as unknown as Record<string, unknown>,
-      }),
-    );
-  }
-
-  const rawBody = request.headers.get('Content-Type')?.includes('application/json')
-    ? await request.json().catch(() => null)
-    : null;
-  const parsedBody = parseInternalRefreshRuntimeUpdates(rawBody);
-  if (!parsedBody) {
-    return new Response('Forbidden', { status: 403 });
-  }
-
-  const result = await runInternalStatusRefreshCore({
-    env,
-    now: Math.floor(Date.now() / 1000),
-    ...(parsedBody.runtime_updates ? { runtimeUpdates: parsedBody.runtime_updates } : {}),
-    trace,
-  });
-
-  return finalizeInternalStatusRefreshResponse(
-    buildInternalRefreshResponse(result.ok, result.refreshed),
-    trace,
-    traceMod,
-    { refreshed: result.refreshed, ...(result.error ? { error: true } : {}) },
-  );
-}
-
 async function handleInternalScheduledCheckBatch(
   request: Request,
   env: Env,
@@ -575,9 +496,6 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === '/api/v1/internal/refresh/homepage') {
       return handleInternalHomepageRefresh(request, env);
-    }
-    if (url.pathname === '/api/v1/internal/refresh/status') {
-      return handleInternalStatusRefresh(request, env);
     }
     if (url.pathname === '/api/v1/internal/scheduled/check-batch') {
       return handleInternalScheduledCheckBatch(request, env, ctx);

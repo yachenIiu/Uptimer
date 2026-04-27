@@ -40,7 +40,6 @@ const INTERNAL_PROTOCOL_FORMAT = 'compact-v1';
 const INTERNAL_SCHEDULED_BATCH_SIZE = 6;
 const INTERNAL_SCHEDULED_BATCH_CONCURRENCY = 2;
 const HOMEPAGE_REFRESH_SERVICE_TIMEOUT_MS = 15_000;
-const STATUS_REFRESH_SERVICE_TIMEOUT_MS = 15_000;
 const INTERNAL_SCHEDULED_CHECK_BATCH_TIMEOUT_MS = 30_000;
 const BATCH_EXECUTION_LOCK_PREFIX = 'scheduler:batch:';
 const MONITOR_EXECUTION_LOCK_PREFIX = 'scheduler:batch-monitor:';
@@ -155,11 +154,6 @@ function shouldRefreshHomepageDirect(env: Env): boolean {
   return isTruthyEnvFlag(rawEnv.UPTIMER_SCHEDULED_HOMEPAGE_DIRECT);
 }
 
-function shouldRefreshStatusViaService(env: Env): boolean {
-  const rawEnv = env as unknown as Record<string, unknown>;
-  return isTruthyEnvFlag(rawEnv.UPTIMER_SCHEDULED_STATUS_SERVICE);
-}
-
 function readBoundedPositiveIntegerEnv(
   env: Env,
   key: string,
@@ -207,42 +201,6 @@ async function fetchSelfWithTimeout(
   }
 }
 
-function buildScheduledRefreshHeaders(
-  env: Env,
-  contentType: string,
-  traceId: string | null,
-): Record<string, string> {
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${env.ADMIN_TOKEN}`,
-    'X-Uptimer-Internal-Format': INTERNAL_PROTOCOL_FORMAT,
-    'Content-Type': contentType,
-    'X-Uptimer-Refresh-Source': 'scheduled',
-  };
-  if (traceId) {
-    headers['X-Uptimer-Trace'] = '1';
-    headers['X-Uptimer-Trace-Id'] = traceId;
-    headers['X-Uptimer-Trace-Mode'] = 'scheduled';
-    const traceToken = readScheduledTraceToken(env);
-    if (traceToken) {
-      headers['X-Uptimer-Trace-Token'] = traceToken;
-    }
-  }
-  return headers;
-}
-
-function parseRefreshServiceResult(bodyText: string): HomepageRefreshServiceResult {
-  let refreshed: boolean | null = null;
-  if (bodyText) {
-    try {
-      const parsed = JSON.parse(bodyText) as { refreshed?: unknown };
-      refreshed = typeof parsed.refreshed === 'boolean' ? parsed.refreshed : null;
-    } catch {
-      refreshed = null;
-    }
-  }
-  return { refreshed };
-}
-
 async function refreshHomepageSnapshotViaService(
   env: Env,
   opts: {
@@ -254,13 +212,25 @@ async function refreshHomepageSnapshotViaService(
   }
 
   const runtimeUpdates = opts.runtimeUpdates?.length ? opts.runtimeUpdates : undefined;
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${env.ADMIN_TOKEN}`,
+    'X-Uptimer-Internal-Format': INTERNAL_PROTOCOL_FORMAT,
+    'Content-Type': runtimeUpdates
+      ? 'application/json; charset=utf-8'
+      : 'text/plain; charset=utf-8',
+    'X-Uptimer-Refresh-Source': 'scheduled',
+  };
   const traceScheduledRefresh = shouldTraceScheduledRefresh(env);
   const traceId = traceScheduledRefresh ? crypto.randomUUID() : null;
-  const headers = buildScheduledRefreshHeaders(
-    env,
-    runtimeUpdates ? 'application/json; charset=utf-8' : 'text/plain; charset=utf-8',
-    traceId,
-  );
+  if (traceScheduledRefresh) {
+    headers['X-Uptimer-Trace'] = '1';
+    headers['X-Uptimer-Trace-Id'] = traceId ?? crypto.randomUUID();
+    headers['X-Uptimer-Trace-Mode'] = 'scheduled';
+    const traceToken = readScheduledTraceToken(env);
+    if (traceToken) {
+      headers['X-Uptimer-Trace-Token'] = traceToken;
+    }
+  }
   const res = await fetchSelfWithTimeout(
     env,
     new Request('http://internal/api/v1/internal/refresh/homepage', {
@@ -285,50 +255,19 @@ async function refreshHomepageSnapshotViaService(
   if (!res.ok) {
     throw new Error(`service refresh failed: HTTP ${res.status} ${bodyText}`.trim());
   }
-  return parseRefreshServiceResult(bodyText);
-}
-
-async function refreshStatusSnapshotViaService(
-  env: Env,
-  opts: {
-    runtimeUpdates?: MonitorRuntimeUpdate[];
-  } = {},
-): Promise<HomepageRefreshServiceResult> {
-  if (!env.ADMIN_TOKEN) {
-    throw new Error('ADMIN_TOKEN missing');
+  let refreshed: boolean | null = null;
+  if (bodyText) {
+    try {
+      const parsed = JSON.parse(bodyText) as { refreshed?: unknown };
+      refreshed = typeof parsed.refreshed === 'boolean' ? parsed.refreshed : null;
+    } catch {
+      refreshed = null;
+    }
   }
 
-  const runtimeUpdates = opts.runtimeUpdates?.length ? opts.runtimeUpdates : undefined;
-  const traceScheduledRefresh = shouldTraceScheduledRefresh(env);
-  const traceId = traceScheduledRefresh ? crypto.randomUUID() : null;
-  const headers = buildScheduledRefreshHeaders(
-    env,
-    'application/json; charset=utf-8',
-    traceId,
-  );
-  const res = await fetchSelfWithTimeout(
-    env,
-    new Request('http://internal/api/v1/internal/refresh/status', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        runtime_updates: runtimeUpdates ? encodeMonitorRuntimeUpdatesCompact(runtimeUpdates) : [],
-      }),
-    }),
-    STATUS_REFRESH_SERVICE_TIMEOUT_MS,
-    'status refresh service',
-  );
-  if (traceScheduledRefresh) {
-    console.log(
-      `scheduled: status_refresh_trace request_trace_id=${traceId ?? '-'} response_trace_id=${res.headers.get('X-Uptimer-Trace-Id') ?? '-'} response_trace=${res.headers.get('X-Uptimer-Trace') ?? '-'} server_timing=${res.headers.get('Server-Timing') ?? '-'}`,
-    );
-  }
-
-  const bodyText = await res.text().catch(() => '');
-  if (!res.ok) {
-    throw new Error(`service status refresh failed: HTTP ${res.status} ${bodyText}`.trim());
-  }
-  return parseRefreshServiceResult(bodyText);
+  return {
+    refreshed,
+  };
 }
 
 function toInteger(value: unknown): number | null {
@@ -1403,21 +1342,6 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
     runtimeUpdates?: MonitorRuntimeUpdate[],
     runtimeSnapshotBaseline?: PublicMonitorRuntimeSnapshot,
   ) => {
-    const queueStatusRefresh = async () => {
-      if (!env.SELF || !shouldRefreshStatusViaService(env)) {
-        return;
-      }
-      await refreshStatusSnapshotViaService(env, runtimeUpdates ? { runtimeUpdates } : undefined)
-        .then((result) => {
-          console.log(
-            `scheduled: status_refresh_service route=internal/status-refresh mode=scheduled ok=1 refreshed=${result.refreshed === true ? 1 : 0} runtime_updates=${runtimeUpdates?.length ?? 0}`,
-          );
-        })
-        .catch((err) => {
-          console.warn('status snapshot: service refresh failed', err);
-        });
-    };
-
     if (shouldRefreshHomepageDirect(env)) {
       return runInternalHomepageRefreshCore({
         env,
@@ -1430,11 +1354,10 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
           ? { scheduledRuntimeSnapshotBaseline: runtimeSnapshotBaseline }
           : {}),
       })
-        .then(async (result) => {
+        .then((result) => {
           console.log(
             `scheduled: homepage_refresh_direct route=internal/homepage-refresh mode=scheduled direct=1 ok=${result.ok ? 1 : 0} refreshed=${result.refreshed ? 1 : 0} runtime_updates=${runtimeUpdates?.length ?? 0} base_snapshot=${result.baseSnapshotSource ?? '-'} skip=${result.skip ?? '-'} error=${result.error ? 1 : 0}`,
           );
-          await queueStatusRefresh();
         })
         .catch((err) => {
           console.warn('homepage snapshot: direct refresh failed', err);
@@ -1447,19 +1370,18 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
           runtimeUpdates ? { runtimeUpdates } : undefined,
         )
           .then(async (result) => {
-            if (runtimeUpdates?.length && result.refreshed === false) {
-              await refreshHomepageSnapshotInline(env, currentNow()).catch((fallbackErr) => {
-                console.warn('homepage snapshot: refresh failed', fallbackErr);
-              });
+            if (!runtimeUpdates?.length || result.refreshed !== false) {
+              return;
             }
-            await queueStatusRefresh();
+            await refreshHomepageSnapshotInline(env, currentNow()).catch((fallbackErr) => {
+              console.warn('homepage snapshot: refresh failed', fallbackErr);
+            });
           })
           .catch(async (err) => {
             console.warn('homepage snapshot: service refresh failed', err);
             await refreshHomepageSnapshotInline(env, currentNow()).catch((fallbackErr) => {
               console.warn('homepage snapshot: refresh failed', fallbackErr);
             });
-            await queueStatusRefresh();
           })
       : refreshHomepageSnapshotInline(env, currentNow()).catch((err) => {
           console.warn('homepage snapshot: refresh failed', err);

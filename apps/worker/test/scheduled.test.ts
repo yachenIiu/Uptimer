@@ -562,58 +562,6 @@ describe('scheduler/scheduled regression', () => {
     });
   });
 
-  it('queues the split internal status refresh service when enabled', async () => {
-    const checkedAt = Math.floor(Math.floor(Date.now() / 1000) / 60) * 60;
-    const env = createEnv({
-      dueRows: [
-        {
-          id: 1,
-          name: 'API',
-          type: 'http',
-          target: 'https://example.com',
-          interval_sec: 60,
-          created_at: 1_760_000_000,
-          timeout_ms: 10_000,
-          http_method: 'GET',
-          http_headers_json: null,
-          http_body: null,
-          expected_status_json: null,
-          response_keyword: null,
-          response_keyword_mode: null,
-          response_forbidden_keyword: null,
-          response_forbidden_keyword_mode: null,
-          state_status: 'up',
-          state_last_error: null,
-          last_changed_at: 1_760_000_000,
-          consecutive_failures: 0,
-          consecutive_successes: 1,
-        },
-      ],
-    }) as unknown as Env;
-    env.ADMIN_TOKEN = 'test-admin-token';
-    env.UPTIMER_SCHEDULED_STATUS_SERVICE = '1';
-    const selfFetch = vi.fn(async () =>
-      new Response(JSON.stringify({ ok: true, refreshed: true }), { status: 200 }),
-    );
-    env.SELF = { fetch: selfFetch } as unknown as Fetcher;
-    const waitUntil = vi.fn();
-
-    await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
-    await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
-
-    expect(selfFetch).toHaveBeenCalledTimes(2);
-    const paths = selfFetch.mock.calls.map((call) => new URL((call[0] as Request).url).pathname);
-    expect(paths).toEqual([
-      '/api/v1/internal/refresh/homepage',
-      '/api/v1/internal/refresh/status',
-    ]);
-    const statusReq = selfFetch.mock.calls[1]?.[0] as Request;
-    expect(statusReq.headers.get('X-Uptimer-Internal-Format')).toBe('compact-v1');
-    await expect(statusReq.json()).resolves.toEqual({
-      runtime_updates: [[1, 60, 1_760_000_000, checkedAt, 'up', 'up', 21]],
-    });
-  });
-
   it('uses internal service batches for large due sets and normalizes returned runtime updates', async () => {
     const checkedAt = Math.floor(Math.floor(Date.now() / 1000) / 60) * 60;
     const dueRows = Array.from({ length: 7 }, (_, index) => ({
