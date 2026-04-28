@@ -299,6 +299,8 @@ describe('internal sharded public snapshot continuation route', () => {
     const payload = { ...statusPayload(), generated_at: generatedAt };
     const selfRequests: Request[] = [];
     const waitUntil = vi.fn();
+    const continuationResponse = new Response(JSON.stringify({ ok: true }), { status: 200 });
+    const continuationBodyRead = vi.spyOn(continuationResponse, 'text');
     const env = {
       DB: createFakeD1Database([
         {
@@ -328,7 +330,7 @@ describe('internal sharded public snapshot continuation route', () => {
       SELF: {
         fetch: vi.fn(async (request: Request) => {
           selfRequests.push(request);
-          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+          return continuationResponse;
         }),
       },
     } as unknown as Env;
@@ -370,6 +372,7 @@ describe('internal sharded public snapshot continuation route', () => {
     expect(waitUntil).toHaveBeenCalledTimes(1);
     await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
     expect(selfRequests).toHaveLength(1);
+    expect(continuationBodyRead).toHaveBeenCalledTimes(1);
     expect(new URL(selfRequests[0]!.url).pathname).toBe(
       '/api/v1/internal/continue/sharded-public-snapshot',
     );

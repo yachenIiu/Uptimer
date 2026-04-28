@@ -156,10 +156,18 @@ function queueContinuation(
         },
         body: JSON.stringify(toWireStep(nextStep)),
       }),
-    ).catch((err) => {
-      console.warn('sharded public snapshot continuation dispatch failed', err);
-      return new Response(null, { status: 500 });
-    }),
+    )
+      .then(async (res) => {
+        const bodyText = await res.text().catch(() => '');
+        if (!res.ok) {
+          throw new Error(
+            `sharded public snapshot continuation failed: HTTP ${res.status} ${bodyText}`.trim(),
+          );
+        }
+      })
+      .catch((err) => {
+        console.warn('sharded public snapshot continuation dispatch failed', err);
+      }),
   );
   return true;
 }
